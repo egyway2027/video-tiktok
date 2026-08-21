@@ -22,9 +22,14 @@ def download_tiktok_video(url: str, output_path: str) -> bool:
     """تحميل الفيديو من تيك توك بأعلى جودة بدون علامة مائية"""
     ydl_opts = {
         'outtmpl': output_path,
-        'format': 'best[ext=mp4]/best',
+        'format': 'bestvideo*+bestaudio/best',
+        'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
+        'postprocessors': [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }],
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
