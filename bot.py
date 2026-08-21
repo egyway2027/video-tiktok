@@ -60,8 +60,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(file_path, 'rb') as video_file:
                 await context.bot.send_video(
                     chat_id=TARGET_GROUP_ID,
-                    video=video_file,
-                    caption=f"🎥 تم التحميل بواسطة: @{update.effective_user.username or user_id}\n🔗 الرابط: {tiktok_url}"
+                    video=video_file
                 )
             await status_msg.edit_text("✅ تم إرسال الفيديو إلى المجموعة بنجاح.")
         else:
