@@ -1,0 +1,50 @@
+name: Continuous Telegram Bot Runner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  run-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Dependencies & FFmpeg
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Bot with Auto-Respawn Loop
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          echo "Starting Telegram Bot..."
+          python bot.py &
+          BOT_PID=$!
+          
+          # الانتظار لمدة 5 ساعات و50 دقيقة (21000 ثانية)
+          sleep 21000
+          
+          echo "Triggering next workflow instance..."
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/$REPO_NAME/actions/workflows/bot_runner.yml/dispatches \
+            -d '{"ref":"main"}'
+          
+          # إنهاء الجلسة الحالية بسلام لتسليم الراية للجلسة الجديدة
+          kill $BOT_PID
