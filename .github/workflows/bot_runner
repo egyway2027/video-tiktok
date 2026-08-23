@@ -1,0 +1,66 @@
+name: Personal Telegram Video Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: personal-telegram-video-bot
+  cancel-in-progress: true
+
+jobs:
+  run-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Setup Deno for yt-dlp EJS
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.6.6
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Prepare optional Facebook/Instagram/TikTok Cookies
+        env:
+          COOKIES_B64: ${{ secrets.COOKIES_B64 }}
+        run: |
+          if [ -n "${COOKIES_B64:-}" ]; then
+            printf '%s' "$COOKIES_B64" | base64 --decode > cookies.txt
+            chmod 600 cookies.txt
+            echo "Cookies file prepared."
+          else
+            echo "No Cookies secret configured."
+          fi
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          COOKIES_FILE: cookies.txt
+          GH_TOKEN: ${{ github.token }}
+          REPO_NAME: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_STATE_PATH: bot_state.json
+        run: |
+          python bot.py
