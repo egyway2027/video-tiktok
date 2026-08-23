@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import sqlite3
+import hashlib
 
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,17 @@ DATABASE_PATH = Path("bot.db")
 # الحد الأقصى للملف
 # نترك هامشًا تحت حد Telegram
 MAX_FILE_SIZE = 49 * 1024 * 1024
+
+# =========================================================
+# التعديل 1
+# عدد عمليات التحميل المتزامنة
+# =========================================================
+
+MAX_CONCURRENT_DOWNLOADS = 2
+
+download_semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT_DOWNLOADS
+)
 
 
 # =========================================================
@@ -134,6 +146,18 @@ def init_database():
             )
 
             # -------------------------------------------------
+            # منع تكرار نفس الملف باستخدام SHA-256
+            # -------------------------------------------------
+
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_videos_file_hash
+                ON videos (file_hash)
+                """
+            )
+
+            # -------------------------------------------------
             # تسجيل الجروب الافتراضي
             # -------------------------------------------------
 
@@ -173,6 +197,50 @@ def init_database():
 
 
 # =========================================================
+# حساب SHA-256 للملف
+# =========================================================
+
+def calculate_file_hash(
+    file_path: str,
+):
+    """
+    حساب SHA-256 للملف لمنع تكرار نفس الفيديو
+    حتى لو كان الرابط مختلفًا.
+    """
+
+    try:
+
+        sha256 = hashlib.sha256()
+
+        with open(
+            file_path,
+            "rb",
+        ) as file:
+
+            while True:
+
+                chunk = file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                sha256.update(chunk)
+
+        return sha256.hexdigest()
+
+    except Exception as e:
+
+        logger.exception(
+            "File hash error: %s",
+            e,
+        )
+
+        return None
+
+
+# =========================================================
 # إدارة الجروبات
 # =========================================================
 
@@ -205,7 +273,9 @@ def get_target_group_id():
     return TARGET_GROUP_ID
 
 
-def set_target_group_id(group_id: int):
+def set_target_group_id(
+    group_id: int,
+):
     """
     حفظ الجروب المستهدف.
     """
@@ -215,12 +285,21 @@ def set_target_group_id(group_id: int):
 
             conn.execute(
                 """
-                INSERT INTO settings (key, value)
-                VALUES ('target_group_id', ?)
+                INSERT INTO settings (
+                    key,
+                    value
+                )
+                VALUES (
+                    'target_group_id',
+                    ?
+                )
                 ON CONFLICT(key)
-                DO UPDATE SET value = excluded.value
+                DO UPDATE SET
+                    value = excluded.value
                 """,
-                (str(group_id),),
+                (
+                    str(group_id),
+                ),
             )
 
             conn.commit()
@@ -228,10 +307,12 @@ def set_target_group_id(group_id: int):
         return True
 
     except Exception as e:
+
         logger.exception(
             "Set target group error: %s",
             e,
         )
+
         return False
 
 
@@ -273,10 +354,12 @@ def register_group(
         return True
 
     except Exception as e:
+
         logger.exception(
             "Register group error: %s",
             e,
         )
+
         return False
 
 
@@ -286,7 +369,10 @@ def get_registered_groups():
     """
 
     try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
 
             rows = conn.execute(
                 """
@@ -299,6 +385,7 @@ def get_registered_groups():
             return rows
 
     except Exception as e:
+
         logger.exception(
             "Get registered groups error: %s",
             e,
@@ -350,6 +437,7 @@ async def is_authorized_admin(
         return False
 
     try:
+
         member = await context.bot.get_chat_member(
             chat.id,
             user_id,
@@ -609,7 +697,7 @@ async def admin_callback(
             group_id = int(
                 data.split(
                     ":",
-                    1
+                    1,
                 )[1]
             )
 
@@ -635,13 +723,16 @@ async def admin_callback(
         for row in groups:
 
             try:
+
                 allowed_group_ids.add(
                     int(row[0])
                 )
+
             except (
                 ValueError,
                 TypeError,
             ):
+
                 continue
 
         if group_id not in allowed_group_ids:
@@ -834,7 +925,9 @@ def get_video_key(
     )
 
 
-def get_video_info(url: str):
+def get_video_info(
+    url: str,
+):
     """
     استخراج معلومات الفيديو بدون تحميله.
     """
@@ -938,11 +1031,52 @@ def is_video_downloaded(
         return False
 
 
+def is_file_hash_downloaded(
+    file_hash: str,
+):
+    """
+    التحقق من أن نفس الملف تم حفظه سابقًا.
+    """
+
+    if not file_hash:
+        return False
+
+    try:
+
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
+
+            row = conn.execute(
+                """
+                SELECT id
+                FROM videos
+                WHERE file_hash = ?
+                LIMIT 1
+                """,
+                (
+                    file_hash,
+                ),
+            ).fetchone()
+
+            return row is not None
+
+    except Exception as e:
+
+        logger.exception(
+            "File hash database check error: %s",
+            e,
+        )
+
+        return False
+
+
 def save_downloaded_video(
     platform: str,
     video_id: str,
     url: str,
     title: str = "",
+    file_hash: str = None,
 ):
     """
     حفظ الفيديو بعد نجاح الإرسال.
@@ -960,15 +1094,17 @@ def save_downloaded_video(
                     platform,
                     video_id,
                     url,
+                    file_hash,
                     title,
                     downloaded_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     platform,
                     video_id,
                     url,
+                    file_hash,
                     title,
                     datetime.now().isoformat(
                         timespec="seconds"
@@ -979,9 +1115,10 @@ def save_downloaded_video(
             conn.commit()
 
         logger.info(
-            "Video saved: %s | %s",
+            "Video saved: %s | %s | hash=%s",
             platform,
             video_id,
+            file_hash,
         )
 
         return True
@@ -1016,7 +1153,9 @@ URL_REGEX = re.compile(
 )
 
 
-def extract_url(text: str):
+def extract_url(
+    text: str,
+):
     """
     استخراج أول رابط من الرسالة.
     """
@@ -1043,7 +1182,9 @@ def extract_url(text: str):
 # معرفة الموقع
 # =========================================================
 
-def get_site_name(url: str):
+def get_site_name(
+    url: str,
+):
     """
     معرفة الموقع بشكل تقريبي.
     """
@@ -1089,8 +1230,10 @@ def download_video(
 
     ydl_opts = {
 
+        # -------------------------------------------------
         # اختيار جودة مناسبة لتليجرام
-        # الأولوية لـ 720p ثم 480p ثم أقل جودة متاحة
+        # -------------------------------------------------
+
         "format": (
             "bestvideo[height<=720][filesize<=45000000][ext=mp4]+"
             "bestaudio[filesize<=5000000][ext=m4a]/"
@@ -1101,31 +1244,55 @@ def download_video(
             "best"
         ),
 
+        # -------------------------------------------------
         # دمج النتيجة إلى MP4
+        # -------------------------------------------------
+
         "merge_output_format": "mp4",
 
+        # -------------------------------------------------
         # مكان الملف
+        # -------------------------------------------------
+
         "outtmpl": output_template,
 
+        # -------------------------------------------------
         # تقليل الـ logs
+        # -------------------------------------------------
+
         "quiet": True,
         "no_warnings": True,
 
+        # -------------------------------------------------
         # IPv4
+        # -------------------------------------------------
+
         "source_address": "0.0.0.0",
 
+        # -------------------------------------------------
         # إعادة المحاولة
+        # -------------------------------------------------
+
         "retries": 3,
         "fragment_retries": 3,
 
+        # -------------------------------------------------
         # عدم تحميل Playlist
+        # -------------------------------------------------
+
         "noplaylist": True,
 
+        # -------------------------------------------------
         # عدم حفظ ملفات إضافية
+        # -------------------------------------------------
+
         "writethumbnail": False,
         "writeinfojson": False,
 
+        # -------------------------------------------------
         # تحويل الفيديو إلى MP4
+        # -------------------------------------------------
+
         "postprocessors": [
             {
                 "key": "FFmpegVideoConvertor",
@@ -1221,6 +1388,45 @@ def download_video(
         )
 
         return None, None
+
+
+# =========================================================
+# إرسال الفيديو إلى Telegram
+# =========================================================
+
+async def send_video_to_telegram(
+    context,
+    target_group_id,
+    file_path,
+    caption,
+):
+    """
+    إرسال الفيديو إلى Telegram.
+
+    التعديل 3:
+    ضبط read/write timeout أكبر للرفع.
+    """
+
+    with open(
+        file_path,
+        "rb",
+    ) as video_file:
+
+        await context.bot.send_video(
+            chat_id=target_group_id,
+            video=video_file,
+            caption=caption,
+            supports_streaming=True,
+
+            # -------------------------------------------------
+            # مهلات أكبر لرفع الملفات
+            # -------------------------------------------------
+
+            read_timeout=300,
+            write_timeout=300,
+            connect_timeout=60,
+            pool_timeout=60,
+        )
 
 
 # =========================================================
@@ -1346,7 +1552,7 @@ async def handle_message(
         )
 
         # =================================================
-        # منع التكرار
+        # منع التكرار قبل التحميل
         # =================================================
 
         already_downloaded = (
@@ -1367,7 +1573,8 @@ async def handle_message(
             return
 
         # =================================================
-        # تحميل الفيديو
+        # التعديل 2
+        # تحديد عدد عمليات التحميل المتزامنة
         # =================================================
 
         await status_msg.edit_text(
@@ -1375,14 +1582,21 @@ async def handle_message(
             f"{site_name}..."
         )
 
-        file_path, info = (
-            await loop.run_in_executor(
-                None,
-                download_video,
+        async with download_semaphore:
+
+            logger.info(
+                "Download slot acquired: %s",
                 url,
-                output_template,
             )
-        )
+
+            file_path, info = (
+                await loop.run_in_executor(
+                    None,
+                    download_video,
+                    url,
+                    output_template,
+                )
+            )
 
         # =================================================
         # التحقق من نجاح التحميل
@@ -1436,12 +1650,56 @@ async def handle_message(
             return
 
         # =================================================
+        # حساب SHA-256
+        # =================================================
+
+        await status_msg.edit_text(
+            "🔎 جاري التحقق من الفيديو..."
+        )
+
+        file_hash = await loop.run_in_executor(
+            None,
+            calculate_file_hash,
+            file_path,
+        )
+
+        if not file_hash:
+
+            await status_msg.edit_text(
+                "❌ تعذر التحقق من ملف الفيديو."
+            )
+
+            return
+
+        logger.info(
+            "File SHA-256: %s",
+            file_hash,
+        )
+
+        # =================================================
+        # التحقق من تكرار الملف نفسه
+        # =================================================
+
+        if is_file_hash_downloaded(
+            file_hash
+        ):
+
+            await status_msg.edit_text(
+                "ℹ️ هذا الفيديو موجود بالفعل "
+                "في قاعدة البيانات، "
+                "حتى لو تم إرساله من رابط مختلف."
+            )
+
+            return
+
+        # =================================================
         # عنوان الفيديو
         # =================================================
 
         title = ""
 
         if info:
+
             title = (
                 info.get("title")
                 or ""
@@ -1453,6 +1711,7 @@ async def handle_message(
         caption = "🎬 تم تحميل الفيديو"
 
         if title:
+
             caption += (
                 f"\n\n{title}"
             )
@@ -1482,28 +1741,36 @@ async def handle_message(
             "📤 جاري إرسال الفيديو إلى الجروب..."
         )
 
-        with open(
-            file_path,
-            "rb",
-        ) as video_file:
+        # =================================================
+        # التعديل 3
+        # رفع الفيديو بمهلات أكبر
+        # =================================================
 
-            await context.bot.send_video(
-                chat_id=target_group_id,
-                video=video_file,
-                caption=caption,
-                supports_streaming=True,
-            )
+        await send_video_to_telegram(
+            context,
+            target_group_id,
+            file_path,
+            caption,
+        )
 
         # =================================================
         # حفظ الفيديو بعد نجاح الإرسال
         # =================================================
 
-        save_downloaded_video(
+        saved = save_downloaded_video(
             platform,
             video_id,
             url,
             title,
+            file_hash,
         )
+
+        if not saved:
+
+            logger.warning(
+                "Video was sent successfully "
+                "but database record already exists."
+            )
 
         # =================================================
         # رسالة النجاح
@@ -1607,6 +1874,14 @@ def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+
+        # =================================================
+        # التعديل 4
+        # السماح بمعالجة Updates بشكل متزامن
+        # =================================================
+
+        .concurrent_updates(True)
+
         .build()
     )
 
