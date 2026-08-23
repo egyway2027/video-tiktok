@@ -165,6 +165,20 @@ def init_database() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS pending_downloads (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                platform TEXT,
+                video_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_platform_video_id
             ON videos(platform, video_id)
             WHERE platform IS NOT NULL AND platform != ''
@@ -174,6 +188,9 @@ def init_database() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_videos_url ON videos(url)"
         )
+        # Pending confirmations should not survive for days after a runner restart.
+        cutoff = datetime.fromtimestamp(datetime.now().timestamp() - 3600).isoformat(timespec="seconds")
+        conn.execute("DELETE FROM pending_downloads WHERE created_at < ?", (cutoff,))
         conn.commit()
 
 
@@ -580,10 +597,10 @@ async def set_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_video_key(info: Optional[dict], url: str) -> tuple[str, str]:
     if not info:
-        return "", url
-    platform = str(info.get("extractor_key") or info.get("extractor") or "")
-    video_id = str(info.get("id") or "")
-    return platform, video_id or url
+        return "", canonicalize_url(url)
+    platform = str(info.get("extractor_key") or info.get("extractor") or "").strip().lower()
+    video_id = str(info.get("id") or "").strip()
+    return platform, video_id or canonicalize_url(url)
 
 
 def is_video_downloaded(platform: str, video_id: str, url: str) -> bool:
@@ -596,13 +613,13 @@ def is_video_downloaded(platform: str, video_id: str, url: str) -> bool:
                 ).fetchone()
                 if row:
                     return True
-            if url:
-                row = conn.execute(
-                    "SELECT 1 FROM videos WHERE url=? LIMIT 1",
-                    (url,),
-                ).fetchone()
-                if row:
-                    return True
+            canonical = canonicalize_url(url)
+            row = conn.execute(
+                "SELECT 1 FROM videos WHERE url=? LIMIT 1",
+                (canonical,),
+            ).fetchone()
+            if row:
+                return True
     except Exception as exc:
         logger.warning("Duplicate check failed: %s", exc)
     return False
@@ -617,19 +634,21 @@ def save_downloaded_video(
 ) -> bool:
     try:
         with db_connect() as conn:
+            now = datetime.now().isoformat(timespec="seconds")
             conn.execute(
                 """
-                INSERT INTO videos(platform, video_id, url, file_hash, title, downloaded_at)
+                INSERT OR IGNORE INTO videos(platform, video_id, url, file_hash, title, downloaded_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    platform,
-                    video_id,
-                    url,
-                    file_hash,
-                    title,
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
+                (platform, video_id, canonicalize_url(url), file_hash, title, now),
+            )
+            conn.execute(
+                """
+                UPDATE videos
+                SET url=?, file_hash=?, title=?, downloaded_at=?
+                WHERE platform=? AND video_id=?
+                """,
+                (canonicalize_url(url), file_hash, title, now, platform, video_id),
             )
             conn.commit()
         return True
@@ -638,6 +657,55 @@ def save_downloaded_video(
     except Exception as exc:
         logger.warning("Could not save downloaded video: %s", exc)
         return False
+
+
+def create_pending_download(
+    user_id: int, chat_id: int, message_id: int, url: str, platform: str, video_id: str
+) -> str:
+    token = hashlib.sha256(
+        f"{user_id}:{chat_id}:{message_id}:{url}:{datetime.now().timestamp()}".encode()
+    ).hexdigest()[:24]
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO pending_downloads
+                    (token, user_id, chat_id, message_id, url, platform, video_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (token, str(user_id), str(chat_id), str(message_id), canonicalize_url(url),
+                 platform, video_id, datetime.now().isoformat(timespec="seconds")),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Could not create pending download: %s", exc)
+        return ""
+    return token
+
+
+def get_pending_download(token: str) -> Optional[dict]:
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT user_id, chat_id, message_id, url, platform, video_id FROM pending_downloads WHERE token=?",
+                (token,),
+            ).fetchone()
+        if not row:
+            return None
+        return {"user_id": int(row[0]), "chat_id": int(row[1]), "message_id": int(row[2]),
+                "url": row[3], "platform": row[4] or "", "video_id": row[5] or ""}
+    except Exception as exc:
+        logger.warning("Could not read pending download: %s", exc)
+        return None
+
+
+def delete_pending_download(token: str) -> None:
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM pending_downloads WHERE token=?", (token,))
+            conn.commit()
+    except Exception:
+        pass
 
 
 def sha256_file(path: str) -> str:
@@ -651,6 +719,25 @@ def sha256_file(path: str) -> str:
 # =========================================================
 # URL / site helpers
 # =========================================================
+
+
+def canonicalize_url(url: str) -> str:
+    """Remove common tracking parameters so equivalent share links match."""
+    url = normalize_url(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.scheme or not parsed.netloc:
+            return url
+        tracking = {
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "fbclid", "igsh", "igshid", "si", "feature", "share_id",
+        }
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+                 if k.lower() not in tracking and not k.lower().startswith("utm_")]
+        return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"),
+                                        urllib.parse.urlencode(query), ""))
+    except Exception:
+        return url
 
 
 def extract_url(text: str) -> Optional[str]:
@@ -705,6 +792,8 @@ def get_common_ydl_options() -> dict:
         "http_headers": {
             "User-Agent": HTTP_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.google.com/",
         },
     }
 
@@ -715,6 +804,12 @@ def get_common_ydl_options() -> dict:
     # especially YouTube. Deno is preferred and is installed by the workflow.
     if shutil.which("deno"):
         options["js_runtimes"] = {"deno": {}}
+
+    # Let yt-dlp use browser impersonation when a site challenges non-browser
+    # clients. This is especially useful for modern social-media endpoints.
+    options["extractor_args"] = {"generic": {"impersonate": [""]}}
+    if os.getenv("YTDLP_IMPERSONATE", "1").strip().lower() in {"0", "false", "no"}:
+        options.pop("extractor_args", None)
 
     return options
 
@@ -1061,9 +1156,10 @@ def get_download_error_message(site_name: str) -> str:
         f"❌ لم أستطع استخراج فيديو {site_name}.\n\n"
         "الأسباب الأقرب:\n"
         "• الرابط خاص أو يحتاج تسجيل دخول.\n"
-        "• الموقع غيّر طريقة تشغيل/حماية الفيديو.\n"
-        "• الفيديو غير متاح من سيرفر GitHub.\n"
-        "• الرابط منتهي أو غير صالح."
+        "• الموقع غيّر طريقة الحماية/الاستخراج.\n"
+        "• جلسة Cookies غير موجودة أو منتهية.\n"
+        "• الفيديو غير متاح من سيرفر GitHub أو الرابط منتهي.\n\n"
+        "💡 البوت يستخدم أحدث yt-dlp مع browser impersonation، لكن المحتوى المقيد لا يمكن تجاوزه بدون جلسة صالحة."
         f"{cookie_hint}"
     )
 
@@ -1073,7 +1169,7 @@ def get_download_error_message(site_name: str) -> str:
 # =========================================================
 
 
-async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, status_msg):
+async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, status_msg, force_download: bool = False, known_key: Optional[tuple[str, str]] = None):
     site_name = get_site_name(url)
     user_id = update.effective_user.id if update.effective_user else 0
     message_id = update.message.message_id if update.message else 0
@@ -1091,12 +1187,31 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
 
             info = await loop.run_in_executor(None, extract_info, url)
             platform = ""
-            video_id = url
+            video_id = canonicalize_url(url)
             if info:
                 platform, video_id = get_video_key(info, url)
+            elif known_key:
+                platform, video_id = known_key
 
-            if info and is_video_downloaded(platform, video_id, url):
-                await status_msg.edit_text("ℹ️ هذا الفيديو تم تحميله وإرساله من قبل.")
+            if not force_download and is_video_downloaded(platform, video_id, url):
+                owner_id = update.effective_user.id if update.effective_user else 0
+                chat_id = update.effective_chat.id if update.effective_chat else 0
+                source_message_id = (
+                    update.message.message_id if update.message
+                    else (update.callback_query.message.message_id if update.callback_query and update.callback_query.message else 0)
+                )
+                token = create_pending_download(owner_id, chat_id, source_message_id, url, platform, video_id)
+                keyboard = []
+                if token:
+                    keyboard = [[
+                        InlineKeyboardButton("🔄 تحميل مرة أخرى", callback_data=f"download_again:{token}"),
+                        InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_download:{token}"),
+                    ]]
+                await status_msg.edit_text(
+                    "⚠️ هذا الفيديو تم تحميله وإرساله من قبل.\n\n"
+                    "هل تريد تحميله مرة أخرى؟",
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                )
                 return
 
             await status_msg.edit_text(
@@ -1281,6 +1396,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def download_duplicate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not await is_owner(update):
+        if query:
+            await query.answer("⛔ غير مسموح لك.", show_alert=True)
+        return
+
+    data = query.data or ""
+    token = data.split(":", 1)[1] if ":" in data else ""
+    pending = get_pending_download(token)
+    if not pending:
+        await query.answer("انتهت صلاحية الطلب.", show_alert=True)
+        return
+    if pending["user_id"] != update.effective_user.id:
+        await query.answer("⛔ هذا الطلب ليس لك.", show_alert=True)
+        return
+
+    await query.answer()
+    if data.startswith("cancel_download:"):
+        delete_pending_download(token)
+        await query.edit_message_text("❌ تم إلغاء إعادة التحميل.")
+        return
+
+    delete_pending_download(token)
+    await query.edit_message_text("🔄 تم اختيار إعادة التحميل...\nجاري بدء العملية من جديد.")
+    await process_url(
+        update, context, pending["url"], query.message,
+        force_download=True,
+        known_key=(pending["platform"], pending["video_id"]),
+    )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Telegram application error: %s", context.error)
 
@@ -1301,13 +1448,14 @@ def main():
     logger.info("FFmpeg: %s", "OK" if ffmpeg_exists() else "MISSING")
     logger.info("ffprobe: %s", "OK" if ffprobe_exists() else "MISSING")
     logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
-    logger.info("Cookies: %s", "configured" if COOKIES_FILE else "not configured")
+    logger.info("Cookies: %s", "configured" if COOKIES_FILE and Path(COOKIES_FILE).exists() else "not configured")
     logger.info("GitHub persistent state: %s", "enabled" if GITHUB_TOKEN and GITHUB_REPO else "disabled")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("setgroup", set_group_command))
+    app.add_handler(CallbackQueryHandler(download_duplicate_callback, pattern=r"^(download_again|cancel_download):"))
     app.add_handler(CallbackQueryHandler(admin_callback))
     app.add_handler(
         MessageHandler(
