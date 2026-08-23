@@ -2,8 +2,8 @@ import os
 import re
 import asyncio
 import logging
-import tempfile
-import shutil
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import yt_dlp
@@ -16,16 +16,22 @@ from telegram.ext import (
     ContextTypes
 )
 
+
 # =========================================================
 # الإعدادات
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# المجموعة الحالية مؤقتًا
+# سنجعلها قابلة للتغيير من البوت في خطوة لاحقة
 TARGET_GROUP_ID = -1004468483224
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# قاعدة بيانات SQLite
+DATABASE_PATH = Path("bot.db")
 
 # الحد الأقصى لحجم الملف قبل محاولة إرساله إلى Telegram
 MAX_FILE_SIZE = 49 * 1024 * 1024
@@ -41,6 +47,57 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# SQLite Database
+# =========================================================
+
+def init_database():
+    """
+    إنشاء قاعدة البيانات والجداول المطلوبة.
+    """
+
+    try:
+
+        with sqlite3.connect(DATABASE_PATH) as conn:
+
+            # جدول إعدادات البوت
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+
+            # جدول الفيديوهات
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS videos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT,
+                    video_id TEXT,
+                    url TEXT,
+                    file_hash TEXT,
+                    title TEXT,
+                    downloaded_at TEXT
+                )
+            """)
+
+            conn.commit()
+
+        logger.info(
+            "SQLite database initialized successfully: %s",
+            DATABASE_PATH
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Database initialization error: %s",
+            e
+        )
+
+        raise
 
 
 # =========================================================
@@ -87,8 +144,8 @@ def get_site_name(url: str):
 
     sites = {
         "tiktok.com": "TikTok",
-        "youtube.com": "YouTube",
         "youtu.be": "YouTube",
+        "youtube.com": "YouTube",
         "instagram.com": "Instagram",
         "facebook.com": "Facebook",
         "fb.watch": "Facebook",
@@ -103,6 +160,7 @@ def get_site_name(url: str):
     }
 
     for domain, name in sites.items():
+
         if domain in url_lower:
             return name
 
@@ -119,6 +177,7 @@ def download_video(url: str, output_template: str):
     """
 
     ydl_opts = {
+
         # أفضل فيديو + أفضل صوت
         "format": "bestvideo*+bestaudio/best",
 
@@ -179,18 +238,24 @@ def download_video(url: str, output_template: str):
                 )
 
                 if filepath and os.path.exists(filepath):
+
                     return filepath, info
 
             # محاولة معرفة اسم الملف من yt-dlp
             filepath = ydl.prepare_filename(info)
 
-            # بعد الدمج قد يتحول إلى mp4
-            mp4_path = os.path.splitext(filepath)[0] + ".mp4"
+            # بعد الدمج قد يتحول إلى MP4
+            mp4_path = (
+                os.path.splitext(filepath)[0]
+                + ".mp4"
+            )
 
             if os.path.exists(mp4_path):
+
                 return mp4_path, info
 
             if os.path.exists(filepath):
+
                 return filepath, info
 
             return None, info
@@ -222,13 +287,19 @@ async def handle_message(
 
     text = update.message.text
 
+    # -----------------------------------------------------
     # استخراج الرابط
+    # -----------------------------------------------------
+
     url = extract_url(text)
 
     if not url:
         return
 
-    # اسم الموقع
+    # -----------------------------------------------------
+    # معرفة الموقع
+    # -----------------------------------------------------
+
     site_name = get_site_name(url)
 
     logger.info(
@@ -236,11 +307,18 @@ async def handle_message(
         url
     )
 
+    # -----------------------------------------------------
+    # رسالة الحالة
+    # -----------------------------------------------------
+
     status_msg = await update.message.reply_text(
         f"⏳ جاري تحميل الفيديو من {site_name}..."
     )
 
+    # -----------------------------------------------------
     # إنشاء اسم فريد للملف
+    # -----------------------------------------------------
+
     user_id = (
         update.effective_user.id
         if update.effective_user
@@ -261,7 +339,10 @@ async def handle_message(
 
     try:
 
+        # -------------------------------------------------
         # تشغيل yt-dlp في Thread منفصل
+        # -------------------------------------------------
+
         loop = asyncio.get_running_loop()
 
         file_path, info = await loop.run_in_executor(
@@ -297,13 +378,17 @@ async def handle_message(
             file_size / (1024 * 1024)
         )
 
-        # Telegram Bot API له حد لحجم الملفات المرسلة
+        # -------------------------------------------------
+        # التحقق من حجم الملف
+        # -------------------------------------------------
+
         if file_size > MAX_FILE_SIZE:
 
             await status_msg.edit_text(
                 f"⚠️ تم تحميل الفيديو بنجاح، "
                 f"لكن حجمه كبير جدًا للإرسال عبر Telegram.\n\n"
-                f"الحجم: {file_size / (1024 * 1024):.1f} MB"
+                f"الحجم: "
+                f"{file_size / (1024 * 1024):.1f} MB"
             )
 
             return
@@ -315,6 +400,7 @@ async def handle_message(
         title = ""
 
         if info:
+
             title = info.get("title") or ""
 
         caption = "🎬 تم تحميل الفيديو"
@@ -340,7 +426,7 @@ async def handle_message(
             )
 
         # -------------------------------------------------
-        # تحديث الرسالة
+        # تحديث رسالة الحالة
         # -------------------------------------------------
 
         await status_msg.edit_text(
@@ -374,6 +460,7 @@ async def handle_message(
         if file_path and os.path.exists(file_path):
 
             try:
+
                 os.remove(file_path)
 
             except Exception as e:
@@ -390,11 +477,25 @@ async def handle_message(
 
 def main():
 
+    # -----------------------------------------------------
+    # التأكد من وجود التوكن
+    # -----------------------------------------------------
+
     if not BOT_TOKEN:
 
         raise ValueError(
             "BOT_TOKEN is not set in environment variables."
         )
+
+    # -----------------------------------------------------
+    # تهيئة SQLite
+    # -----------------------------------------------------
+
+    init_database()
+
+    # -----------------------------------------------------
+    # إنشاء تطبيق Telegram
+    # -----------------------------------------------------
 
     app = (
         ApplicationBuilder()
@@ -402,7 +503,10 @@ def main():
         .build()
     )
 
+    # -----------------------------------------------------
     # استقبال أي رسالة نصية تحتوي على رابط
+    # -----------------------------------------------------
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & (~filters.COMMAND),
@@ -411,8 +515,12 @@ def main():
     )
 
     logger.info(
-        "Universal Video Downloader Bot started..."
+        "Universal Video Downloader Bot started."
     )
+
+    # -----------------------------------------------------
+    # تشغيل البوت
+    # -----------------------------------------------------
 
     app.run_polling()
 
