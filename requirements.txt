@@ -1,2 +1,2 @@
 python-telegram-bot==22.8
-yt-dlp[default]==2026.7.4
+yt-dlp[default,curl-cffi]==2026.08.19
