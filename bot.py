@@ -3,7 +3,6 @@ import re
 import asyncio
 import logging
 import sqlite3
-import urllib.request
 
 from datetime import datetime
 from pathlib import Path
@@ -36,29 +35,68 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 
 # الجروب الافتراضي
-TARGET_GROUP_ID = -1004468483224
+TARGET_GROUP_ID = int(
+    os.getenv(
+        "TARGET_GROUP_ID",
+        "-1004468483224",
+    )
+)
+
+# =========================================================
+# Cookies
+# =========================================================
+
+# يمكن وضع ملف cookies.txt بجانب ملف البوت
+# أو تحديد مساره من Environment Variable:
+#
+# COOKIES_FILE=/path/to/cookies.txt
+#
+COOKIES_FILE = os.getenv(
+    "COOKIES_FILE",
+    "cookies.txt",
+).strip()
+
+# ---------------------------------------------------------
+# اختياري:
+#
+# لو السيرفر عليه Chrome / Firefox / Edge وغيرها
+# يمكن تحديد:
+#
+# COOKIES_FROM_BROWSER=chrome
+#
+# أو:
+# COOKIES_FROM_BROWSER=firefox
+#
+# اتركه فارغًا إذا كنت تستخدم cookies.txt
+# ---------------------------------------------------------
+
+COOKIES_FROM_BROWSER = os.getenv(
+    "COOKIES_FROM_BROWSER",
+    "",
+).strip()
+
+# User-Agent
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+)
 
 # مجلد تحميل الفيديوهات
 DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 # قاعدة البيانات
 DATABASE_PATH = Path("bot.db")
 
 # الحد الأقصى للملف
-# نترك هامشًا تحت حد Telegram
 MAX_FILE_SIZE = 49 * 1024 * 1024
-
-# ---------------------------------------------------------
-# Cookies اختيارية
-#
-# مثال:
-# COOKIES_FILE=/home/bot/cookies.txt
-#
-# لو مش محتاجها اترك المتغير غير موجود.
-# ---------------------------------------------------------
-
-COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 
 
 # =========================================================
@@ -66,7 +104,12 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 # =========================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format=(
+        "%(asctime)s - "
+        "%(name)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
     level=logging.INFO,
 )
 
@@ -74,22 +117,113 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# Locks
+# أدوات yt-dlp
 # =========================================================
 
-# منع معالجة نفس الفيديو أكثر من مرة في نفس الوقت.
-video_locks = {}
-
-
-def get_video_lock(key: str):
+def get_common_ydl_options():
     """
-    الحصول على Lock خاص بالفيديو.
+    إعدادات مشتركة لكل عمليات yt-dlp.
+
+    أهم شيء هنا:
+    - Cookies
+    - User-Agent
+    - timeout
+    - retries
+    - IPv4
     """
 
-    if key not in video_locks:
-        video_locks[key] = asyncio.Lock()
+    options = {
+        "quiet": True,
+        "no_warnings": True,
 
-    return video_locks[key]
+        "noplaylist": True,
+
+        "source_address": "0.0.0.0",
+
+        "socket_timeout": 30,
+
+        "retries": 5,
+        "fragment_retries": 5,
+
+        "retry_sleep_functions": {
+            "http": lambda n: min(5, n),
+        },
+
+        "http_headers": {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+
+        "geo_bypass": True,
+
+        "nocheckcertificate": False,
+    }
+
+    # -----------------------------------------------------
+    # استخدام cookies.txt إذا كان موجودًا
+    # -----------------------------------------------------
+
+    cookie_path = Path(COOKIES_FILE)
+
+    if cookie_path.exists() and cookie_path.is_file():
+
+        logger.info(
+            "Using cookies file: %s",
+            cookie_path,
+        )
+
+        options["cookiefile"] = str(
+            cookie_path.resolve()
+        )
+
+    # -----------------------------------------------------
+    # أو استخدام Cookies من المتصفح
+    # -----------------------------------------------------
+
+    elif COOKIES_FROM_BROWSER:
+
+        browser_name = (
+            COOKIES_FROM_BROWSER
+            .strip()
+            .lower()
+        )
+
+        supported_browsers = {
+            "chrome",
+            "chromium",
+            "firefox",
+            "edge",
+            "opera",
+            "brave",
+            "safari",
+        }
+
+        if browser_name in supported_browsers:
+
+            logger.info(
+                "Using cookies from browser: %s",
+                browser_name,
+            )
+
+            options["cookiesfrombrowser"] = (
+                browser_name,
+            )
+
+        else:
+
+            logger.warning(
+                "Unsupported browser for "
+                "COOKIES_FROM_BROWSER: %s",
+                browser_name,
+            )
+
+    else:
+
+        logger.info(
+            "No cookies configured."
+        )
+
+    return options
 
 
 # =========================================================
@@ -103,7 +237,9 @@ def init_database():
 
     try:
 
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
 
             # -------------------------------------------------
             # جدول الإعدادات
@@ -209,13 +345,12 @@ def init_database():
 # =========================================================
 
 def get_target_group_id():
-    """
-    الحصول على الجروب المستهدف من قاعدة البيانات.
-    """
 
     try:
 
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
 
             row = conn.execute(
                 """
@@ -240,23 +375,33 @@ def get_target_group_id():
     return TARGET_GROUP_ID
 
 
-def set_target_group_id(group_id: int):
-    """
-    حفظ الجروب المستهدف.
-    """
+def set_target_group_id(
+    group_id: int,
+):
 
     try:
 
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
 
             conn.execute(
                 """
-                INSERT INTO settings (key, value)
-                VALUES ('target_group_id', ?)
+                INSERT INTO settings (
+                    key,
+                    value
+                )
+                VALUES (
+                    'target_group_id',
+                    ?
+                )
                 ON CONFLICT(key)
-                DO UPDATE SET value = excluded.value
+                DO UPDATE SET
+                    value = excluded.value
                 """,
-                (str(group_id),),
+                (
+                    str(group_id),
+                ),
             )
 
             conn.commit()
@@ -277,13 +422,12 @@ def register_group(
     group_id: int,
     title: str = "",
 ):
-    """
-    تسجيل الجروب في قاعدة البيانات.
-    """
 
     try:
 
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
 
             conn.execute(
                 """
@@ -322,13 +466,12 @@ def register_group(
 
 
 def get_registered_groups():
-    """
-    الحصول على الجروبات المسجلة.
-    """
 
     try:
 
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with sqlite3.connect(
+            DATABASE_PATH
+        ) as conn:
 
             rows = conn.execute(
                 """
@@ -358,28 +501,26 @@ async def is_authorized_admin(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    السماح لمالك البوت أو أدمن الجروب الحالي.
-    """
 
     if not update.effective_user:
         return False
 
     user_id = update.effective_user.id
 
-    # -------------------------------------------------
+    # -----------------------------------------------------
     # مالك البوت
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
     if (
         ADMIN_USER_ID
-        and str(user_id) == str(ADMIN_USER_ID)
+        and str(user_id)
+        == str(ADMIN_USER_ID)
     ):
         return True
 
-    # -------------------------------------------------
+    # -----------------------------------------------------
     # أدمن الجروب
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
     chat = update.effective_chat
 
@@ -394,9 +535,11 @@ async def is_authorized_admin(
 
     try:
 
-        member = await context.bot.get_chat_member(
-            chat.id,
-            user_id,
+        member = (
+            await context.bot.get_chat_member(
+                chat.id,
+                user_id,
+            )
         )
 
         return member.status in (
@@ -422,16 +565,15 @@ async def admin_panel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    عرض لوحة إدارة الجروبات.
-    """
 
     if not update.message:
         return
 
-    authorized = await is_authorized_admin(
-        update,
-        context,
+    authorized = (
+        await is_authorized_admin(
+            update,
+            context,
+        )
     )
 
     if not authorized:
@@ -442,14 +584,13 @@ async def admin_panel(
 
         return
 
-    current_group_id = get_target_group_id()
+    current_group_id = (
+        get_target_group_id()
+    )
+
     groups = get_registered_groups()
 
     keyboard = []
-
-    # -------------------------------------------------
-    # الجروبات المسجلة
-    # -------------------------------------------------
 
     for group_id, title in groups:
 
@@ -460,7 +601,8 @@ async def admin_panel(
 
         prefix = (
             "✅ "
-            if str(group_id) == str(current_group_id)
+            if str(group_id)
+            == str(current_group_id)
             else "📍 "
         )
 
@@ -477,22 +619,16 @@ async def admin_panel(
             ]
         )
 
-    # -------------------------------------------------
-    # تسجيل الجروب الحالي
-    # -------------------------------------------------
-
     keyboard.append(
         [
             InlineKeyboardButton(
                 "➕ تسجيل الجروب الحالي",
-                callback_data="register_current_group",
+                callback_data=(
+                    "register_current_group"
+                ),
             )
         ]
     )
-
-    # -------------------------------------------------
-    # عرض الجروب الحالي
-    # -------------------------------------------------
 
     keyboard.append(
         [
@@ -514,25 +650,24 @@ async def admin_panel(
 
 
 # =========================================================
-# Callback الخاص بلوحة الإدارة
+# Callback الإدارة
 # =========================================================
 
 async def admin_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    معالجة أزرار لوحة الإدارة.
-    """
 
     query = update.callback_query
 
     if not query:
         return
 
-    authorized = await is_authorized_admin(
-        update,
-        context,
+    authorized = (
+        await is_authorized_admin(
+            update,
+            context,
+        )
     )
 
     if not authorized:
@@ -548,13 +683,15 @@ async def admin_callback(
 
     data = query.data or ""
 
-    # =================================================
-    # عرض الجروب الحالي
-    # =================================================
+    # =====================================================
+    # الجروب الحالي
+    # =====================================================
 
     if data == "current_group":
 
-        group_id = get_target_group_id()
+        group_id = (
+            get_target_group_id()
+        )
 
         title = "غير معروف"
 
@@ -585,9 +722,9 @@ async def admin_callback(
 
         return
 
-    # =================================================
+    # =====================================================
     # تسجيل الجروب الحالي
-    # =================================================
+    # =====================================================
 
     if data == "register_current_group":
 
@@ -638,9 +775,9 @@ async def admin_callback(
 
         return
 
-    # =================================================
+    # =====================================================
     # اختيار جروب
-    # =================================================
+    # =====================================================
 
     if data.startswith("select_group:"):
 
@@ -649,7 +786,7 @@ async def admin_callback(
             group_id = int(
                 data.split(
                     ":",
-                    1
+                    1,
                 )[1]
             )
 
@@ -663,10 +800,6 @@ async def admin_callback(
             )
 
             return
-
-        # -------------------------------------------------
-        # التأكد أن الجروب مسجل
-        # -------------------------------------------------
 
         groups = get_registered_groups()
 
@@ -694,10 +827,6 @@ async def admin_callback(
 
             return
 
-        # -------------------------------------------------
-        # التأكد أن البوت يستطيع الوصول إليه
-        # -------------------------------------------------
-
         try:
 
             chat = await context.bot.get_chat(
@@ -717,10 +846,6 @@ async def admin_callback(
             )
 
             return
-
-        # -------------------------------------------------
-        # حفظ الجروب
-        # -------------------------------------------------
 
         success = set_target_group_id(
             group_id
@@ -753,9 +878,6 @@ async def set_group_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    تعيين الجروب الحالي كجروب استقبال.
-    """
 
     if not update.effective_chat:
         return
@@ -773,9 +895,11 @@ async def set_group_command(
 
         return
 
-    authorized = await is_authorized_admin(
-        update,
-        context,
+    authorized = (
+        await is_authorized_admin(
+            update,
+            context,
+        )
     )
 
     if not authorized:
@@ -832,9 +956,6 @@ def get_video_key(
     info,
     url: str,
 ):
-    """
-    الحصول على platform + video_id.
-    """
 
     if not info:
         return None, None
@@ -865,9 +986,6 @@ def is_video_downloaded(
     video_id: str,
     url: str,
 ):
-    """
-    التحقق من أن الفيديو تم إرساله سابقًا.
-    """
 
     try:
 
@@ -927,9 +1045,6 @@ def save_downloaded_video(
     url: str,
     title: str = "",
 ):
-    """
-    حفظ الفيديو بعد نجاح الإرسال.
-    """
 
     try:
 
@@ -1000,9 +1115,6 @@ URL_REGEX = re.compile(
 
 
 def extract_url(text: str):
-    """
-    استخراج أول رابط من الرسالة.
-    """
 
     if not text:
         return None
@@ -1026,9 +1138,6 @@ def extract_url(text: str):
 # =========================================================
 
 def get_site_name(url: str):
-    """
-    معرفة الموقع بشكل تقريبي.
-    """
 
     url_lower = url.lower()
 
@@ -1058,289 +1167,17 @@ def get_site_name(url: str):
 
 
 # =========================================================
-# تنظيف اسم الملف
-# =========================================================
-
-def sanitize_filename(name: str):
-    """
-    تنظيف اسم الملف من الرموز غير المناسبة.
-    """
-
-    if not name:
-        return "video"
-
-    name = re.sub(
-        r'[\\/:*?"<>|]+',
-        "_",
-        name,
-    )
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name,
-    ).strip()
-
-    return name[:100] or "video"
-
-
-# =========================================================
-# حل روابط Facebook المختصرة
-# =========================================================
-
-def resolve_url(url: str):
-    """
-    محاولة الوصول إلى الرابط النهائي.
-
-    مهم خصوصًا لروابط:
-    facebook.com/share/r/...
-    """
-
-    try:
-
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/131.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=15,
-        ) as response:
-
-            final_url = response.geturl()
-
-            if final_url:
-                logger.info(
-                    "Resolved URL: %s -> %s",
-                    url,
-                    final_url,
-                )
-
-                return final_url
-
-    except Exception as e:
-
-        logger.warning(
-            "Could not resolve URL: %s | %s",
-            url,
-            e,
-        )
-
-    return url
-
-
-# =========================================================
-# إعدادات yt-dlp الأساسية
-# =========================================================
-
-def get_base_ydl_opts():
-    """
-    إعدادات مشتركة لـ yt-dlp.
-    """
-
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-
-        "source_address": "0.0.0.0",
-
-        "retries": 3,
-        "fragment_retries": 3,
-
-        "socket_timeout": 30,
-
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/131.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-
-        "merge_output_format": "mp4",
-
-        "writethumbnail": False,
-        "writeinfojson": False,
-
-        "postprocessors": [
-            {
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }
-        ],
-    }
-
-    # -------------------------------------------------
-    # Cookies اختيارية
-    # -------------------------------------------------
-
-    if (
-        COOKIES_FILE
-        and os.path.isfile(COOKIES_FILE)
-    ):
-
-        opts["cookiefile"] = COOKIES_FILE
-
-        logger.info(
-            "Using cookies file: %s",
-            COOKIES_FILE,
-        )
-
-    return opts
-
-
-# =========================================================
 # استخراج معلومات الفيديو
 # =========================================================
 
 def get_video_info(url: str):
-    """
-    استخراج معلومات الفيديو بدون تحميله.
 
-    نجرب الرابط الأصلي أولًا.
-    ثم نجرب الرابط النهائي إذا كان Redirect.
-    """
-
-    urls_to_try = [url]
-
-    # -------------------------------------------------
-    # خصوصًا Facebook share/r
-    # -------------------------------------------------
-
-    url_lower = url.lower()
-
-    if (
-        "facebook.com/share/" in url_lower
-        or "fb.watch" in url_lower
-    ):
-
-        resolved = resolve_url(url)
-
-        if (
-            resolved
-            and resolved != url
-        ):
-            urls_to_try.append(resolved)
-
-    for current_url in urls_to_try:
-
-        ydl_opts = get_base_ydl_opts()
-
-        ydl_opts.update(
-            {
-                "skip_download": True,
-            }
-        )
-
-        try:
-
-            logger.info(
-                "Trying video info URL: %s",
-                current_url,
-            )
-
-            with yt_dlp.YoutubeDL(
-                ydl_opts
-            ) as ydl:
-
-                info = ydl.extract_info(
-                    current_url,
-                    download=False,
-                )
-
-                if info:
-
-                    # نحتفظ بالرابط الفعلي
-                    info["_original_url"] = url
-                    info["_resolved_url"] = current_url
-
-                    return info
-
-        except Exception as e:
-
-            logger.warning(
-                "Video information failed: %s | %s",
-                current_url,
-                e,
-            )
-
-    logger.error(
-        "Could not extract video information: %s",
-        url,
-    )
-
-    return None
-
-
-# =========================================================
-# تحميل الفيديو
-# =========================================================
-
-def download_video(
-    url: str,
-    output_template: str,
-    quality: str = "720",
-):
-    """
-    تحميل الفيديو باستخدام yt-dlp.
-
-    quality:
-        720
-        480
-        360
-    """
-
-    # -------------------------------------------------
-    # اختيار الجودة
-    # -------------------------------------------------
-
-    if quality == "720":
-
-        video_selector = (
-            "bestvideo[height<=720][ext=mp4]+"
-            "bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4]/"
-            "best[height<=720]"
-        )
-
-    elif quality == "480":
-
-        video_selector = (
-            "bestvideo[height<=480][ext=mp4]+"
-            "bestaudio[ext=m4a]/"
-            "best[height<=480][ext=mp4]/"
-            "best[height<=480]"
-        )
-
-    else:
-
-        video_selector = (
-            "bestvideo[height<=360][ext=mp4]+"
-            "bestaudio[ext=m4a]/"
-            "best[height<=360][ext=mp4]/"
-            "best[height<=360]"
-        )
-
-    ydl_opts = get_base_ydl_opts()
+    ydl_opts = get_common_ydl_options()
 
     ydl_opts.update(
         {
-            "format": video_selector,
-            "outtmpl": output_template,
+            "skip_download": True,
+            "noplaylist": True,
         }
     )
 
@@ -1352,186 +1189,335 @@ def download_video(
 
             info = ydl.extract_info(
                 url,
-                download=True,
+                download=False,
             )
 
-            if not info:
-                return None, None
-
-            # -------------------------------------------------
-            # البحث عن الملف النهائي
-            # -------------------------------------------------
-
-            filepath = None
-
-            requested_downloads = (
-                info.get(
-                    "requested_downloads"
-                )
-            )
-
-            if requested_downloads:
-
-                for item in requested_downloads:
-
-                    candidate = item.get(
-                        "filepath"
-                    )
-
-                    if (
-                        candidate
-                        and os.path.exists(candidate)
-                    ):
-
-                        filepath = candidate
-
-                        break
-
-            # -------------------------------------------------
-            # fallback
-            # -------------------------------------------------
-
-            if not filepath:
-
-                prepared_path = (
-                    ydl.prepare_filename(info)
-                )
-
-                possible_paths = [
-                    prepared_path,
-                    os.path.splitext(
-                        prepared_path
-                    )[0] + ".mp4",
-                ]
-
-                for candidate in possible_paths:
-
-                    if os.path.exists(candidate):
-
-                        filepath = candidate
-
-                        break
-
-            # -------------------------------------------------
-            # البحث عن الملف باستخدام template
-            # -------------------------------------------------
-
-            if not filepath:
-
-                output_base = Path(
-                    output_template.replace(
-                        ".%(ext)s",
-                        "",
-                    )
-                )
-
-                for candidate in DOWNLOAD_DIR.glob(
-                    output_base.name + ".*"
-                ):
-
-                    if candidate.is_file():
-
-                        filepath = str(candidate)
-
-                        break
-
-            if filepath:
-
-                return filepath, info
-
-            return None, info
+            return info
 
     except Exception as e:
 
-        logger.exception(
-            "Download error at quality %s: %s",
-            quality,
+        logger.warning(
+            "Video information extraction failed: %s",
             e,
         )
 
-        return None, None
+        return None
 
 
 # =========================================================
-# محاولة تحميل الفيديو بعدة جودات
+# تحميل الفيديو
 # =========================================================
 
-def download_with_fallback(
+def download_video(
     url: str,
     output_template: str,
 ):
-    """
-    محاولة التحميل:
-        720p
-        ثم 480p
-        ثم 360p
 
-    الهدف إبقاء الملف تحت حد Telegram.
+    """
+    تحميل الفيديو.
+
+    لا نضع filesize داخل format selection
+    لأن بعض المواقع لا ترسل filesize للصيغ،
+    وبالتالي كان yt-dlp ممكن يستبعد كل الصيغ.
+
+    بدل ذلك:
+    1. نحاول MP4 حتى 720p.
+    2. إذا لم توجد صيغة مناسبة نرجع لأفضل فيديو متاح.
+    3. بعد التحميل نفحص حجم الملف فعليًا.
     """
 
-    qualities = [
-        "720",
-        "480",
-        "360",
+    base_options = get_common_ydl_options()
+
+    formats = [
+        (
+            "bestvideo[height<=720][ext=mp4]+"
+            "bestaudio[ext=m4a]/"
+            "best[height<=720][ext=mp4]/"
+            "best[height<=720]"
+        ),
+        (
+            "bestvideo[height<=720]+"
+            "bestaudio/"
+            "best[height<=720]"
+        ),
+        (
+            "best[ext=mp4]/"
+            "best"
+        ),
     ]
 
-    for quality in qualities:
+    last_error = None
 
-        logger.info(
-            "Downloading using quality: %sp",
-            quality,
+    for format_string in formats:
+
+        ydl_opts = dict(
+            base_options
         )
 
-        file_path, info = download_video(
-            url,
-            output_template,
-            quality,
-        )
+        ydl_opts.update(
+            {
+                "format": format_string,
 
-        if (
-            not file_path
-            or not os.path.exists(file_path)
-        ):
-            continue
+                "merge_output_format": "mp4",
 
-        file_size = os.path.getsize(
-            file_path
-        )
+                "outtmpl": output_template,
 
-        logger.info(
-            "Downloaded %sp file: %s | %.2f MB",
-            quality,
-            file_path,
-            file_size / (1024 * 1024),
-        )
+                "writethumbnail": False,
 
-        # -------------------------------------------------
-        # الحجم مناسب
-        # -------------------------------------------------
+                "writeinfojson": False,
 
-        if file_size <= MAX_FILE_SIZE:
-
-            return file_path, info
-
-        # -------------------------------------------------
-        # الملف كبير
-        # -------------------------------------------------
-
-        logger.warning(
-            "File is too large at %sp: %.2f MB",
-            quality,
-            file_size / (1024 * 1024),
+                "postprocessors": [
+                    {
+                        "key": "FFmpegVideoConvertor",
+                        "preferedformat": "mp4",
+                    }
+                ],
+            }
         )
 
         try:
 
-            os.remove(file_path)
+            logger.info(
+                "Trying download format: %s",
+                format_string,
+            )
 
-        except Exception:
+            with yt_dlp.YoutubeDL(
+                ydl_opts
+            ) as ydl:
 
-            pass
+                info = ydl.extract_info(
+                    url,
+                    download=True,
+                )
 
-    return None, None
+                if not info:
+                    continue
+
+                filepath = None
+
+                # -------------------------------------------------
+                # requested_downloads
+                # -------------------------------------------------
+
+                requested_downloads = (
+                    info.get(
+                        "requested_downloads"
+                    )
+                )
+
+                if requested_downloads:
+
+                    for item in requested_downloads:
+
+                        candidate = (
+                            item.get(
+                                "filepath"
+                            )
+                        )
+
+                        if (
+                            candidate
+                            and os.path.exists(
+                                candidate
+                            )
+                        ):
+
+                            filepath = candidate
+                            break
+
+                # -------------------------------------------------
+                # prepared filename
+                # -------------------------------------------------
+
+                if not filepath:
+
+                    prepared_path = (
+                        ydl.prepare_filename(
+                            info
+                        )
+                    )
+
+                    if os.path.exists(
+                        prepared_path
+                    ):
+
+                        filepath = (
+                            prepared_path
+                        )
+
+                    else:
+
+                        possible_extensions = [
+                            ".mp4",
+                            ".mkv",
+                            ".webm",
+                            ".mov",
+                            ".avi",
+                        ]
+
+                        for ext in possible_extensions:
+
+                            candidate = (
+                                os.path.splitext(
+                                    prepared_path
+                                )[0]
+                                + ext
+                            )
+
+                            if os.path.exists(
+                                candidate
+                            ):
+
+                                filepath = candidate
+                                break
+
+                # -------------------------------------------------
+                # البحث عن آخر ملف داخل downloads
+                # -------------------------------------------------
+
+                if not filepath:
+
+                    try:
+
+                        template_prefix = (
+                            Path(output_template)
+                            .name
+                            .split(
+                                ".%(ext)s"
+                            )[0]
+                        )
+
+                        candidates = list(
+                            DOWNLOAD_DIR.glob(
+                                f"{template_prefix}.*"
+                            )
+                        )
+
+                        candidates = [
+                            p
+                            for p in candidates
+                            if p.is_file()
+                        ]
+
+                        if candidates:
+
+                            filepath = str(
+                                max(
+                                    candidates,
+                                    key=lambda p: p.stat().st_mtime,
+                                )
+                            )
+
+                    except Exception:
+                        pass
+
+                if filepath:
+
+                    return (
+                        filepath,
+                        info,
+                        None,
+                    )
+
+                last_error = (
+                    "تم التحميل ولكن لم أجد الملف الناتج."
+                )
+
+        except Exception as e:
+
+            last_error = str(e)
+
+            logger.warning(
+                "Download attempt failed: %s",
+                e,
+            )
+
+            # نحاول format آخر
+            continue
+
+    return (
+        None,
+        None,
+        last_error,
+    )
+
+
+# =========================================================
+# رسالة خطأ مفهومة
+# =========================================================
+
+def get_download_error_message(
+    error,
+    site_name: str,
+):
+
+    error_text = (
+        str(error or "")
+        .lower()
+    )
+
+    # -----------------------------------------------------
+    # Facebook / login / cookies
+    # -----------------------------------------------------
+
+    if (
+        "login" in error_text
+        or "cookies" in error_text
+        or "private" in error_text
+        or "sign in" in error_text
+    ):
+
+        return (
+            "❌ الموقع رفض الوصول إلى الفيديو.\n\n"
+            f"🌐 المصدر: {site_name}\n\n"
+            "غالبًا الفيديو يحتاج تسجيل دخول "
+            "أو Cookies صالحة.\n\n"
+            "إذا كان الفيديو يعمل عندك في المتصفح، "
+            "ضع ملف cookies.txt الصحيح في السيرفر "
+            "أو فعّل COOKIES_FROM_BROWSER."
+        )
+
+    # -----------------------------------------------------
+    # TikTok extraction
+    # -----------------------------------------------------
+
+    if "tiktok" in error_text:
+
+        return (
+            "❌ لم أستطع استخراج فيديو TikTok.\n\n"
+            "قد يكون الرابط مختصرًا أو أن TikTok "
+            "غيّر طريقة الوصول للفيديو.\n\n"
+            "تأكد أولًا أن yt-dlp محدث إلى آخر إصدار."
+        )
+
+    # -----------------------------------------------------
+    # Facebook
+    # -----------------------------------------------------
+
+    if "facebook" in error_text:
+
+        return (
+            "❌ لم أستطع تحميل فيديو Facebook.\n\n"
+            "بعض روابط Facebook تحتاج Cookies "
+            "من جلسة تسجيل الدخول، خصوصًا روابط "
+            "share/reels.\n\n"
+            "ضع cookies.txt صالحًا في السيرفر "
+            "ثم أعد المحاولة."
+        )
+
+    # -----------------------------------------------------
+    # Generic
+    # -----------------------------------------------------
+
+    return (
+        "❌ لم أستطع تحميل الفيديو.\n\n"
+        f"🌐 المصدر: {site_name}\n\n"
+        "قد يكون الرابط غير مدعوم، "
+        "أو الفيديو خاص، "
+        "أو الموقع يحتاج تسجيل دخول، "
+        "أو أن الموقع غيّر طريقة الحماية."
+    )
 
 
 # =========================================================
@@ -1542,16 +1528,13 @@ async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    استقبال الرسائل التي تحتوي على روابط.
-    """
 
     if not update.message:
         return
 
-    # -------------------------------------------------
-    # دعم النص والكابتشن
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # دعم النص العادي + Caption
+    # -----------------------------------------------------
 
     text = (
         update.message.text
@@ -1562,35 +1545,33 @@ async def handle_message(
     if not text:
         return
 
-    # -------------------------------------------------
+    # -----------------------------------------------------
     # استخراج الرابط
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
     url = extract_url(text)
 
     if not url:
         return
 
-    # -------------------------------------------------
-    # معرفة الموقع
-    # -------------------------------------------------
-
-    site_name = get_site_name(url)
+    site_name = get_site_name(
+        url
+    )
 
     logger.info(
         "Received URL: %s",
         url,
     )
 
-    # -------------------------------------------------
+    # -----------------------------------------------------
     # رسالة الحالة
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
     try:
 
         status_msg = (
             await update.message.reply_text(
-                f"⏳ جاري قراءة الفيديو من "
+                f"⏳ جاري معالجة الفيديو من "
                 f"{site_name}..."
             )
         )
@@ -1604,359 +1585,327 @@ async def handle_message(
 
         return
 
+    # -----------------------------------------------------
+    # اسم ملف فريد
+    # -----------------------------------------------------
+
+    user_id = (
+        update.effective_user.id
+        if update.effective_user
+        else 0
+    )
+
+    message_id = (
+        update.message.message_id
+    )
+
+    filename = (
+        f"video_{user_id}_{message_id}.%(ext)s"
+    )
+
+    output_template = str(
+        DOWNLOAD_DIR / filename
+    )
+
     file_path = None
 
-    # -------------------------------------------------
-    # مفتاح مبدئي للـ Lock
-    # -------------------------------------------------
+    try:
 
-    lock_key = url.lower().strip()
+        loop = asyncio.get_running_loop()
 
-    lock = get_video_lock(lock_key)
+        # =================================================
+        # محاولة استخراج المعلومات
+        # =================================================
 
-    # -------------------------------------------------
-    # منع معالجة نفس الرابط بالتوازي
-    # -------------------------------------------------
+        info = await loop.run_in_executor(
+            None,
+            get_video_info,
+            url,
+        )
 
-    async with lock:
+        # -------------------------------------------------
+        # إذا نجحت المعلومات
+        # -------------------------------------------------
+
+        platform = ""
+        video_id = ""
+
+        if info:
+
+            platform, video_id = (
+                get_video_key(
+                    info,
+                    url,
+                )
+            )
+
+            # -------------------------------------------------
+            # منع التكرار
+            # -------------------------------------------------
+
+            already_downloaded = (
+                is_video_downloaded(
+                    platform,
+                    video_id,
+                    url,
+                )
+            )
+
+            if already_downloaded:
+
+                await status_msg.edit_text(
+                    "ℹ️ هذا الفيديو تم تحميله "
+                    "وإرساله من قبل."
+                )
+
+                return
+
+        else:
+
+            # -------------------------------------------------
+            # مهم:
+            #
+            # لا نوقف العملية هنا.
+            #
+            # نحاول التحميل مباشرة مرة أخرى.
+            # -------------------------------------------------
+
+            logger.warning(
+                "Could not extract info first. "
+                "Trying direct download."
+            )
+
+        # =================================================
+        # تحميل الفيديو
+        # =================================================
+
+        await status_msg.edit_text(
+            f"⬇️ جاري تحميل الفيديو من "
+            f"{site_name}..."
+        )
+
+        (
+            file_path,
+            downloaded_info,
+            download_error,
+        ) = await loop.run_in_executor(
+            None,
+            download_video,
+            url,
+            output_template,
+        )
+
+        # -------------------------------------------------
+        # فشل التحميل
+        # -------------------------------------------------
+
+        if (
+            not file_path
+            or not os.path.exists(
+                file_path
+            )
+        ):
+
+            error_message = (
+                get_download_error_message(
+                    download_error,
+                    site_name,
+                )
+            )
+
+            await status_msg.edit_text(
+                error_message
+            )
+
+            return
+
+        # =================================================
+        # تحديث info
+        # =================================================
+
+        if downloaded_info:
+
+            info = downloaded_info
+
+        # =================================================
+        # الحصول على مفتاح الفيديو
+        # =================================================
+
+        if info:
+
+            platform, video_id = (
+                get_video_key(
+                    info,
+                    url,
+                )
+            )
+
+        # =================================================
+        # حجم الملف
+        # =================================================
+
+        file_size = os.path.getsize(
+            file_path
+        )
+
+        logger.info(
+            "Downloaded file: %s | Size: %.2f MB",
+            file_path,
+            file_size / (
+                1024 * 1024
+            ),
+        )
+
+        # =================================================
+        # التحقق من الحجم
+        # =================================================
+
+        if file_size > MAX_FILE_SIZE:
+
+            await status_msg.edit_text(
+                "⚠️ تم تحميل الفيديو بنجاح، "
+                "لكن حجمه كبير جدًا للإرسال عبر Telegram.\n\n"
+                f"📦 الحجم: "
+                f"{file_size / (1024 * 1024):.1f} MB\n"
+                f"📌 الحد الحالي: "
+                f"{MAX_FILE_SIZE / (1024 * 1024):.0f} MB"
+            )
+
+            return
+
+        # =================================================
+        # عنوان الفيديو
+        # =================================================
+
+        title = ""
+
+        if info:
+
+            title = (
+                info.get("title")
+                or ""
+            )
+
+        title = title[:800]
+
+        caption = "🎬 تم تحميل الفيديو"
+
+        if title:
+
+            caption += (
+                f"\n\n{title}"
+            )
+
+        # =================================================
+        # الجروب المستهدف
+        # =================================================
+
+        target_group_id = (
+            get_target_group_id()
+        )
+
+        if not target_group_id:
+
+            await status_msg.edit_text(
+                "❌ لم يتم تحديد جروب استقبال الفيديوهات.\n\n"
+                "استخدم /admin لإدارة الجروب."
+            )
+
+            return
+
+        # =================================================
+        # إرسال الفيديو
+        # =================================================
+
+        await status_msg.edit_text(
+            "📤 جاري إرسال الفيديو إلى الجروب..."
+        )
+
+        with open(
+            file_path,
+            "rb",
+        ) as video_file:
+
+            await context.bot.send_video(
+                chat_id=target_group_id,
+                video=video_file,
+                caption=caption,
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+
+        # =================================================
+        # حفظ الفيديو
+        # =================================================
+
+        save_downloaded_video(
+            platform,
+            video_id,
+            url,
+            title,
+        )
+
+        # =================================================
+        # نجاح
+        # =================================================
+
+        await status_msg.edit_text(
+            "✅ تم تحميل الفيديو وإرساله "
+            "إلى المجموعة بنجاح.\n\n"
+            f"🌐 المصدر: {site_name}"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Processing error: %s",
+            e,
+        )
 
         try:
 
-            loop = asyncio.get_running_loop()
-
-            # =================================================
-            # استخراج معلومات الفيديو
-            # =================================================
-
-            info = await loop.run_in_executor(
-                None,
-                get_video_info,
-                url,
-            )
-
-            if not info:
-
-                await status_msg.edit_text(
-                    "❌ لم أستطع قراءة معلومات الفيديو.\n\n"
-                    "قد يكون الرابط غير مدعوم، "
-                    "أو الفيديو خاص، "
-                    "أو الموقع يحتاج تسجيل دخول.\n\n"
-                    "إذا كان الفيديو من Facebook "
-                    "ويحتاج تسجيل دخول، يمكنك استخدام "
-                    "COOKIES_FILE."
-                )
-
-                return
-
-            # =================================================
-            # الحصول على الرابط النهائي
-            # =================================================
-
-            resolved_url = (
-                info.get("_resolved_url")
-                or url
-            )
-
-            # =================================================
-            # الحصول على مفتاح الفيديو
-            # =================================================
-
-            platform, video_id = get_video_key(
-                info,
-                resolved_url,
-            )
-
-            # =================================================
-            # مفتاح أكثر ثباتًا للـ Lock
-            # =================================================
-
-            video_lock_key = (
-                f"{platform}:{video_id}"
-            )
-
-            if video_lock_key != lock_key:
-
-                video_lock = get_video_lock(
-                    video_lock_key
-                )
-
-            else:
-
-                video_lock = lock
-
-            # -------------------------------------------------
-            # لو كان هناك Lock آخر للفيديو
-            # -------------------------------------------------
-
-            if video_lock is not lock:
-
-                async with video_lock:
-
-                    if is_video_downloaded(
-                        platform,
-                        video_id,
-                        resolved_url,
-                    ):
-
-                        await status_msg.edit_text(
-                            "ℹ️ هذا الفيديو تم تحميله "
-                            "وإرساله من قبل."
-                        )
-
-                        return
-
-            else:
-
-                # =================================================
-                # منع التكرار
-                # =================================================
-
-                already_downloaded = (
-                    is_video_downloaded(
-                        platform,
-                        video_id,
-                        resolved_url,
-                    )
-                )
-
-                if already_downloaded:
-
-                    await status_msg.edit_text(
-                        "ℹ️ هذا الفيديو تم تحميله "
-                        "وإرساله من قبل."
-                    )
-
-                    return
-
-            # =================================================
-            # إنشاء اسم ملف فريد
-            # =================================================
-
-            user_id = (
-                update.effective_user.id
-                if update.effective_user
-                else 0
-            )
-
-            message_id = (
-                update.message.message_id
-            )
-
-            filename = (
-                f"video_{user_id}_{message_id}.%(ext)s"
-            )
-
-            output_template = str(
-                DOWNLOAD_DIR / filename
-            )
-
-            # =================================================
-            # تحميل الفيديو
-            # =================================================
-
             await status_msg.edit_text(
-                f"⬇️ جاري تحميل الفيديو من "
-                f"{site_name}...\n\n"
-                "🎯 الجودة: حتى 720p"
+                "⚠️ حدث خطأ أثناء معالجة الفيديو.\n\n"
+                f"🌐 المصدر: {site_name}\n\n"
+                "حاول إرسال الرابط مرة أخرى."
             )
 
-            file_path, info = (
-                await loop.run_in_executor(
-                    None,
-                    download_with_fallback,
-                    resolved_url,
-                    output_template,
-                )
-            )
+        except Exception:
+            pass
 
-            # =================================================
-            # التحقق من نجاح التحميل
-            # =================================================
+    finally:
 
-            if (
-                not file_path
-                or not os.path.exists(file_path)
-            ):
+        # =================================================
+        # حذف الملف المؤقت
+        # =================================================
 
-                await status_msg.edit_text(
-                    "❌ لم أستطع تحميل الفيديو.\n\n"
-                    "قد يكون الرابط غير مدعوم، "
-                    "أو الفيديو خاص، "
-                    "أو الموقع يحتاج تسجيل دخول.\n\n"
-                    "إذا كان Facebook، جرّب استخدام "
-                    "ملف Cookies صالح."
-                )
-
-                return
-
-            # =================================================
-            # حجم الملف
-            # =================================================
-
-            file_size = os.path.getsize(
+        if (
+            file_path
+            and os.path.exists(
                 file_path
             )
-
-            logger.info(
-                "Final file: %s | Size: %.2f MB",
-                file_path,
-                file_size / (1024 * 1024),
-            )
-
-            # =================================================
-            # التحقق من الحجم
-            # =================================================
-
-            if file_size > MAX_FILE_SIZE:
-
-                await status_msg.edit_text(
-                    "⚠️ تم تحميل الفيديو، "
-                    "لكن حجمه ما زال كبيرًا جدًا للإرسال.\n\n"
-                    f"📦 الحجم: "
-                    f"{file_size / (1024 * 1024):.1f} MB\n"
-                    f"📌 الحد: "
-                    f"{MAX_FILE_SIZE / (1024 * 1024):.0f} MB"
-                )
-
-                return
-
-            # =================================================
-            # عنوان الفيديو
-            # =================================================
-
-            title = ""
-
-            if info:
-
-                title = (
-                    info.get("title")
-                    or ""
-                )
-
-            title = title[:800]
-
-            # =================================================
-            # Caption
-            # =================================================
-
-            caption = "🎬 تم تحميل الفيديو"
-
-            if title:
-
-                caption += (
-                    f"\n\n{title}"
-                )
-
-            # =================================================
-            # الحصول على الجروب المستهدف
-            # =================================================
-
-            target_group_id = (
-                get_target_group_id()
-            )
-
-            if not target_group_id:
-
-                await status_msg.edit_text(
-                    "❌ لم يتم تحديد جروب استقبال الفيديوهات.\n\n"
-                    "استخدم /admin لإدارة الجروب."
-                )
-
-                return
-
-            # =================================================
-            # إرسال الفيديو
-            # =================================================
-
-            await status_msg.edit_text(
-                "📤 جاري إرسال الفيديو إلى الجروب..."
-            )
-
-            with open(
-                file_path,
-                "rb",
-            ) as video_file:
-
-                await context.bot.send_video(
-                    chat_id=target_group_id,
-                    video=video_file,
-                    caption=caption,
-                    supports_streaming=True,
-                )
-
-            # =================================================
-            # حفظ الفيديو بعد نجاح الإرسال
-            # =================================================
-
-            saved = save_downloaded_video(
-                platform,
-                video_id,
-                resolved_url,
-                title,
-            )
-
-            if not saved:
-
-                logger.warning(
-                    "Video was sent but database record "
-                    "could not be inserted."
-                )
-
-            # =================================================
-            # رسالة النجاح
-            # =================================================
-
-            await status_msg.edit_text(
-                "✅ تم تحميل الفيديو وإرساله "
-                "إلى المجموعة بنجاح.\n\n"
-                f"🌐 المصدر: {site_name}"
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                "Processing error: %s",
-                e,
-            )
+        ):
 
             try:
 
-                await status_msg.edit_text(
-                    "⚠️ حدث خطأ أثناء معالجة الفيديو.\n\n"
-                    f"🌐 المصدر: {site_name}\n\n"
-                    "حاول إرسال الرابط مرة أخرى."
+                os.remove(
+                    file_path
                 )
 
-            except Exception:
+                logger.info(
+                    "Temporary file deleted: %s",
+                    file_path,
+                )
 
-                pass
+            except Exception as e:
 
-        finally:
-
-            # =================================================
-            # حذف الملف المؤقت
-            # =================================================
-
-            if (
-                file_path
-                and os.path.exists(file_path)
-            ):
-
-                try:
-
-                    os.remove(file_path)
-
-                    logger.info(
-                        "Temporary file deleted: %s",
-                        file_path,
-                    )
-
-                except Exception as e:
-
-                    logger.warning(
-                        "Could not delete file: %s",
-                        e,
-                    )
+                logger.warning(
+                    "Could not delete file: %s",
+                    e,
+                )
 
 
 # =========================================================
@@ -1967,14 +1916,10 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    تسجيل أخطاء Telegram.
-    """
 
-    logger.error(
+    logger.exception(
         "Telegram application error: %s",
         context.error,
-        exc_info=context.error,
     )
 
 
@@ -1984,9 +1929,9 @@ async def error_handler(
 
 def main():
 
-    # -------------------------------------------------
-    # التأكد من BOT_TOKEN
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # BOT TOKEN
+    # -----------------------------------------------------
 
     if not BOT_TOKEN:
 
@@ -1994,15 +1939,49 @@ def main():
             "BOT_TOKEN is not set in environment variables."
         )
 
-    # -------------------------------------------------
-    # تهيئة قاعدة البيانات
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # DATABASE
+    # -----------------------------------------------------
 
     init_database()
 
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # عرض إعدادات Cookies
+    # -----------------------------------------------------
+
+    logger.info(
+        "Cookies file configured: %s",
+        (
+            str(
+                Path(COOKIES_FILE).resolve()
+            )
+            if COOKIES_FILE
+            else "None"
+        ),
+    )
+
+    if Path(COOKIES_FILE).exists():
+
+        logger.info(
+            "Cookies file FOUND."
+        )
+
+    else:
+
+        logger.info(
+            "Cookies file NOT FOUND."
+        )
+
+    if COOKIES_FROM_BROWSER:
+
+        logger.info(
+            "Browser cookies enabled: %s",
+            COOKIES_FROM_BROWSER,
+        )
+
+    # -----------------------------------------------------
     # إنشاء التطبيق
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
     app = (
         ApplicationBuilder()
@@ -2010,9 +1989,9 @@ def main():
         .build()
     )
 
-    # =================================================
+    # =====================================================
     # أوامر الإدارة
-    # =================================================
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -2028,9 +2007,9 @@ def main():
         )
     )
 
-    # =================================================
-    # أزرار لوحة الإدارة
-    # =================================================
+    # =====================================================
+    # أزرار الإدارة
+    # =====================================================
 
     app.add_handler(
         CallbackQueryHandler(
@@ -2038,9 +2017,9 @@ def main():
         )
     )
 
-    # =================================================
+    # =====================================================
     # الرسائل النصية
-    # =================================================
+    # =====================================================
 
     app.add_handler(
         MessageHandler(
@@ -2050,46 +2029,21 @@ def main():
         )
     )
 
-    # =================================================
-    # الرسائل التي تحتوي على Caption
-    # =================================================
-
-    app.add_handler(
-        MessageHandler(
-            filters.CAPTION
-            & ~filters.COMMAND,
-            handle_message,
-        )
-    )
-
-    # =================================================
+    # =====================================================
     # Error Handler
-    # =================================================
+    # =====================================================
 
     app.add_error_handler(
         error_handler
     )
 
-    # =================================================
-    # بدء البوت
-    # =================================================
+    # =====================================================
+    # Start
+    # =====================================================
 
     logger.info(
         "Universal Video Downloader Bot started."
     )
-
-    if COOKIES_FILE:
-
-        logger.info(
-            "Cookies configured: %s",
-            COOKIES_FILE,
-        )
-
-    else:
-
-        logger.info(
-            "No cookies file configured."
-        )
 
     app.run_polling()
 
