@@ -1,6 +1,11 @@
 {
   "target_group_id": null,
   "target_group_title": "",
-  "groups": [],
-  "updated_at": null
+  "groups": [
+    {
+      "group_id": -1004468483224,
+      "title": "فديوهات"
+    }
+  ],
+  "updated_at": "2026-08-23T11:33:31Z"
 }
