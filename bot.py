@@ -8,16 +8,15 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -35,7 +34,6 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
-# The old hard-coded group is intentionally only a migration fallback.
 LEGACY_TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID", "").strip()
 
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
@@ -48,15 +46,23 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "bot.db"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
 
-# Telegram bots currently have a 50 MB send limit. We deliberately stay below it.
 TELEGRAM_LIMIT_BYTES = 50 * 1024 * 1024
 SAFE_MAX_BYTES = 48 * 1024 * 1024
 COMPRESSION_TARGET_BYTES = 47 * 1024 * 1024
-UNKNOWN_SIZE_TARGET_BYTES = 45 * 1024 * 1024
 
-# One personal bot: keep the system stable and predictable.
-MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+# Album settings requested by the owner.
+ALBUM_SIZE = 4
+ALBUM_FLUSH_SECONDS = max(5, int(os.getenv("ALBUM_FLUSH_SECONDS", "30")))
+
+# Set PROTECT_CONTENT=1 to prevent forwarding/saving of bot-sent media.
+# This does NOT make a group message invisible to selected members; Telegram does
+# not provide per-member message visibility for ordinary forum topics.
+PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 URL_REGEX = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
 
@@ -76,6 +82,16 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# Runtime album queue
+# =========================================================
+
+# queue key = "chat_id:thread_id"
+ALBUM_QUEUES: dict[str, list[dict]] = {}
+ALBUM_TASKS: dict[str, asyncio.Task] = {}
+ALBUM_LOCK = asyncio.Lock()
 
 
 # =========================================================
@@ -101,13 +117,45 @@ def normalize_url(url: str) -> str:
     return url.strip().rstrip(".,!?;:)]}\"'")
 
 
+def canonicalize_url(url: str) -> str:
+    """Normalize common sharing/tracking parameters without destroying useful IDs."""
+    url = normalize_url(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.scheme or not parsed.netloc:
+            return url
+
+        tracking = {
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "fbclid", "igsh", "igshid", "share_id", "share_ref", "ref_src",
+            "si", "feature", "spm", "mc_cid", "mc_eid",
+        }
+        query = [
+            (k, v)
+            for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() not in tracking and not k.lower().startswith("utm_")
+        ]
+        return urllib.parse.urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                parsed.path.rstrip("/"),
+                urllib.parse.urlencode(query),
+                "",
+            )
+        )
+    except Exception:
+        return url
+
+
 def cleanup_download_files(prefix: str) -> None:
     for path in DOWNLOAD_DIR.glob(f"{prefix}*"):
-        if path.is_file():
-            try:
-                path.unlink()
-            except Exception as exc:
-                logger.warning("Could not delete %s: %s", path, exc)
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except Exception as exc:
+            logger.warning("Could not delete %s: %s", path, exc)
 
 
 def safe_filename(value: str, fallback: str = "video") -> str:
@@ -115,12 +163,17 @@ def safe_filename(value: str, fallback: str = "video") -> str:
     return value[:100] or fallback
 
 
-# =========================================================
-# Persistent state
-# =========================================================
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-# SQLite is used locally for fast access. On GitHub Actions, the selected target
-# group is also synchronized to a repository file so it survives runner replacement.
+
+# =========================================================
+# Local + GitHub persistent state
+# =========================================================
 
 
 def db_connect():
@@ -128,6 +181,14 @@ def db_connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
+    columns = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
 def init_database() -> None:
@@ -179,17 +240,28 @@ def init_database() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS bot_access (
+                user_id TEXT PRIMARY KEY,
+                unlocked_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # New columns are added without destroying the user's existing database.
+        _ensure_column(conn, "pending_downloads", "topic_thread_id", "INTEGER")
+        _ensure_column(conn, "pending_downloads", "topic_name", "TEXT")
+
+        conn.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_platform_video_id
             ON videos(platform, video_id)
             WHERE platform IS NOT NULL AND platform != ''
               AND video_id IS NOT NULL AND video_id != ''
             """
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_videos_url ON videos(url)"
-        )
-        # Pending confirmations should not survive for days after a runner restart.
-        cutoff = datetime.fromtimestamp(datetime.now().timestamp() - 3600).isoformat(timespec="seconds")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_url ON videos(url)")
+
+        cutoff = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
         conn.execute("DELETE FROM pending_downloads WHERE created_at < ?", (cutoff,))
         conn.commit()
 
@@ -197,19 +269,19 @@ def init_database() -> None:
 def _read_local_state() -> dict:
     try:
         with STATE_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-            return data if isinstance(data, dict) else {}
+            value = json.load(handle)
+            return value if isinstance(value, dict) else {}
     except Exception:
         return {}
 
 
 def _write_local_state(data: dict) -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(
+    temp = STATE_FILE.with_suffix(".tmp")
+    temp.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    tmp.replace(STATE_FILE)
+    temp.replace(STATE_FILE)
 
 
 def _github_request(method: str, url: str, payload: Optional[dict] = None):
@@ -239,10 +311,9 @@ def _github_request(method: str, url: str, payload: Optional[dict] = None):
             return json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as exc:
         logger.warning("GitHub API %s %s failed: %s", method, url, exc)
-        return None
     except Exception as exc:
         logger.warning("GitHub API error: %s", exc)
-        return None
+    return None
 
 
 def _github_get_state() -> tuple[dict, Optional[str]]:
@@ -290,13 +361,35 @@ def _github_save_state(data: dict, sha: Optional[str], message: str) -> bool:
     return bool(result and result.get("content"))
 
 
+def _get_combined_state() -> dict:
+    local = _read_local_state()
+    remote, _ = _github_get_state()
+    if remote:
+        merged = {**local, **remote}
+        return merged
+    return local
+
+
+def save_state(data: dict, message: str = "Update bot state") -> bool:
+    data = dict(data)
+    data["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _write_local_state(data)
+
+    if GITHUB_TOKEN and GITHUB_REPO:
+        remote, sha = _github_get_state()
+        merged = {**remote, **data}
+        if not _github_save_state(merged, sha, message):
+            logger.warning("State saved locally but GitHub persistence failed")
+            return False
+    return True
+
+
 def get_target_group_id() -> Optional[int]:
-    # Prefer repository-persistent state when running on GitHub Actions.
-    remote_state, _ = _github_get_state()
-    remote_id = remote_state.get("target_group_id")
-    if remote_id:
+    state = _get_combined_state()
+    value = state.get("target_group_id")
+    if value:
         try:
-            return int(remote_id)
+            return int(value)
         except (TypeError, ValueError):
             pass
 
@@ -308,7 +401,7 @@ def get_target_group_id() -> Optional[int]:
             if row and row[0]:
                 return int(row[0])
     except Exception as exc:
-        logger.warning("Could not read local target group: %s", exc)
+        logger.warning("Could not read target group: %s", exc)
 
     if LEGACY_TARGET_GROUP_ID:
         try:
@@ -341,16 +434,11 @@ def set_target_group_id(group_id: int, title: str = "") -> bool:
         logger.exception("Could not save target group locally: %s", exc)
         return False
 
-    # Persist on GitHub when the bot is hosted there.
-    if GITHUB_TOKEN and GITHUB_REPO:
-        state, sha = _github_get_state()
-        state["target_group_id"] = int(group_id)
-        if title:
-            state["target_group_title"] = title
-        state["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        if not _github_save_state(state, sha, "Update Telegram target group"):
-            logger.warning("Target group was saved locally but GitHub persistence failed")
-
+    state = _get_combined_state()
+    state["target_group_id"] = int(group_id)
+    if title:
+        state["target_group_title"] = title
+    save_state(state, "Update Telegram target group")
     return True
 
 
@@ -368,33 +456,30 @@ def register_group(group_id: int, title: str = "") -> bool:
                 (str(group_id), title, datetime.now().isoformat(timespec="seconds")),
             )
             conn.commit()
-
-        if GITHUB_TOKEN and GITHUB_REPO:
-            state, sha = _github_get_state()
-            groups = {
-                str(item.get("group_id")): str(item.get("title") or "")
-                for item in state.get("groups", [])
-                if isinstance(item, dict) and item.get("group_id") is not None
-            }
-            groups[str(group_id)] = title or ""
-            state["groups"] = [
-                {"group_id": int(gid) if str(gid).lstrip("-").isdigit() else gid, "title": name}
-                for gid, name in groups.items()
-            ]
-            state["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-            if not _github_save_state(state, sha, "Register Telegram target group"):
-                logger.warning("Group was registered locally but GitHub persistence failed")
-
-        return True
     except Exception as exc:
         logger.exception("Could not register group: %s", exc)
         return False
 
+    state = _get_combined_state()
+    groups = {
+        str(item.get("group_id")): str(item.get("title") or "")
+        for item in state.get("groups", [])
+        if isinstance(item, dict) and item.get("group_id") is not None
+    }
+    groups[str(group_id)] = title or ""
+    state["groups"] = [
+        {
+            "group_id": int(gid) if str(gid).lstrip("-").isdigit() else gid,
+            "title": name,
+        }
+        for gid, name in groups.items()
+    ]
+    save_state(state, "Register Telegram target group")
+    return True
+
 
 def get_registered_groups() -> list[tuple[str, str]]:
-    """Return groups from local DB plus repository-persistent state."""
     merged: dict[str, str] = {}
-
     try:
         with db_connect() as conn:
             rows = conn.execute(
@@ -405,12 +490,78 @@ def get_registered_groups() -> list[tuple[str, str]]:
     except Exception as exc:
         logger.warning("Could not read local groups: %s", exc)
 
-    remote_state, _ = _github_get_state()
-    for item in remote_state.get("groups", []):
+    state = _get_combined_state()
+    for item in state.get("groups", []):
         if isinstance(item, dict) and item.get("group_id") is not None:
             merged[str(item["group_id"])] = str(item.get("title") or "")
-
     return list(merged.items())
+
+
+# =========================================================
+# Topics
+# =========================================================
+
+
+def get_topics_for_group(group_id: Optional[int] = None) -> dict:
+    group_id = group_id or get_target_group_id()
+    if not group_id:
+        return {}
+    state = _get_combined_state()
+    raw = state.get("topics", {})
+    if not isinstance(raw, dict):
+        return {}
+    values = raw.get(str(group_id), {})
+    if not isinstance(values, dict):
+        return {}
+    return {str(k): v for k, v in values.items() if isinstance(v, dict)}
+
+
+def register_topic(group_id: int, thread_id: int, name: str) -> bool:
+    state = _get_combined_state()
+    all_topics = state.get("topics", {})
+    if not isinstance(all_topics, dict):
+        all_topics = {}
+    group_topics = all_topics.get(str(group_id), {})
+    if not isinstance(group_topics, dict):
+        group_topics = {}
+
+    group_topics[str(thread_id)] = {
+        "thread_id": int(thread_id),
+        "name": name.strip()[:80] or f"موضوع {thread_id}",
+    }
+    all_topics[str(group_id)] = group_topics
+    state["topics"] = all_topics
+    state.setdefault("last_topic", {})
+    save_state(state, "Register Telegram forum topic")
+    return True
+
+
+def set_last_topic(group_id: int, thread_id: int) -> None:
+    state = _get_combined_state()
+    state.setdefault("last_topic", {})
+    state["last_topic"][str(group_id)] = int(thread_id)
+    save_state(state, "Update last selected Telegram topic")
+
+
+def get_last_topic(group_id: Optional[int] = None) -> Optional[int]:
+    group_id = group_id or get_target_group_id()
+    if not group_id:
+        return None
+    state = _get_combined_state()
+    last = state.get("last_topic", {})
+    try:
+        value = last.get(str(group_id))
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_topic_name(group_id: int, thread_id: int) -> str:
+    topics = get_topics_for_group(group_id)
+    item = topics.get(str(thread_id))
+    if isinstance(item, dict):
+        return str(item.get("name") or f"موضوع {thread_id}")
+    return f"موضوع {thread_id}"
 
 
 # =========================================================
@@ -435,130 +586,36 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = get_target_group_id()
     groups = get_registered_groups()
     keyboard = []
-
     for group_id, title in groups:
         try:
             numeric_id = int(group_id)
         except ValueError:
             continue
-        name = title or f"جروب {group_id}"
         prefix = "✅ " if current == numeric_id else "📍 "
         keyboard.append([
             InlineKeyboardButton(
-                f"{prefix}{name}",
+                f"{prefix}{title or ('جروب ' + group_id)}",
                 callback_data=f"select_group:{numeric_id}",
             )
         ])
 
     keyboard.append([
-        InlineKeyboardButton(
-            "➕ تسجيل الجروب الحالي",
-            callback_data="register_current_group",
-        )
+        InlineKeyboardButton("➕ تسجيل الجروب الحالي", callback_data="register_current_group")
     ])
     keyboard.append([
-        InlineKeyboardButton(
-            "🔄 تحديث القائمة",
-            callback_data="refresh_admin",
-        )
+        InlineKeyboardButton("📂 عرض الـTopics", callback_data="show_topics")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("🔄 تحديث", callback_data="refresh_admin")
     ])
 
-    current_text = str(current) if current else "غير محدد"
     await update.message.reply_text(
         "⚙️ لوحة البوت الشخصية\n\n"
-        f"📤 جروب الاستقبال الحالي: `{current_text}`\n\n"
-        "اختر الجروب الذي سيرسل إليه البوت الفيديوهات.\n"
-        "التغيير يتم حفظه ويظل فعالًا بعد إعادة تشغيل السيرفر.",
+        f"📤 جروب الاستقبال الحالي: `{current or 'غير محدد'}`\n\n"
+        "اختر الجروب أو افتح قائمة الـTopics.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    if not await is_owner(update):
-        await query.answer("⛔ غير مسموح لك.", show_alert=True)
-        return
-
-    await query.answer()
-    data = query.data or ""
-
-    if data in {"refresh_admin", "current_group"}:
-        current = get_target_group_id()
-        title = "غير معروف"
-        if current:
-            try:
-                chat = await context.bot.get_chat(current)
-                title = chat.title or title
-            except Exception:
-                pass
-        await query.edit_message_text(
-            "📍 جروب الاستقبال الحالي:\n\n"
-            f"🏷️ الاسم: {title}\n"
-            f"🆔 ID: `{current or 'غير محدد'}`\n\n"
-            "استخدم /admin لعرض قائمة الجروبات المسجلة.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data == "register_current_group":
-        chat = update.effective_chat
-        if not chat or chat.type not in ("group", "supergroup"):
-            await query.edit_message_text(
-                "📌 اضغط هذا الزر من داخل الجروب المطلوب تسجيله."
-            )
-            return
-        if not register_group(chat.id, chat.title or ""):
-            await query.edit_message_text("❌ تعذر تسجيل الجروب.")
-            return
-        await query.edit_message_text(
-            "✅ تم تسجيل الجروب.\n\n"
-            f"🏷️ {chat.title or 'بدون اسم'}\n"
-            f"🆔 `{chat.id}`\n\n"
-            "استخدم /admin مرة أخرى لاختياره كجروب استقبال.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data.startswith("select_group:"):
-        try:
-            group_id = int(data.split(":", 1)[1])
-        except (ValueError, IndexError):
-            await query.edit_message_text("❌ معرف الجروب غير صحيح.")
-            return
-
-        registered_ids = set()
-        for raw_id, _ in get_registered_groups():
-            try:
-                registered_ids.add(int(raw_id))
-            except ValueError:
-                pass
-        if group_id not in registered_ids:
-            await query.edit_message_text("❌ هذا الجروب غير مسجل.")
-            return
-
-        try:
-            chat = await context.bot.get_chat(group_id)
-        except Exception as exc:
-            logger.warning("Target group is unreachable: %s", exc)
-            await query.edit_message_text(
-                "❌ لا أستطيع الوصول إلى هذا الجروب.\n"
-                "تأكد أن البوت موجود داخله."
-            )
-            return
-
-        if not set_target_group_id(group_id, chat.title or ""):
-            await query.edit_message_text("❌ تعذر حفظ الجروب.")
-            return
-
-        await query.edit_message_text(
-            "✅ تم تغيير جروب الاستقبال وحفظه.\n\n"
-            f"🏷️ {chat.title or 'غير معروف'}\n"
-            f"🆔 `{group_id}`",
-            parse_mode="Markdown",
-        )
 
 
 async def set_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -570,15 +627,12 @@ async def set_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat = update.effective_chat
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text(
-            "❌ استخدم /setgroup داخل الجروب الذي تريد تعيينه."
-        )
+        await update.message.reply_text("❌ استخدم /setgroup داخل الجروب المطلوب.")
         return
 
     if not register_group(chat.id, chat.title or ""):
         await update.message.reply_text("❌ تعذر تسجيل الجروب.")
         return
-
     if set_target_group_id(chat.id, chat.title or ""):
         await update.message.reply_text(
             "✅ تم تعيين هذا الجروب كجروب الاستقبال وحفظ الاختيار.\n\n"
@@ -590,6 +644,85 @@ async def set_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ تعذر حفظ جروب الاستقبال.")
 
 
+async def set_topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not await is_owner(update):
+        return
+
+    chat = update.effective_chat
+    message = update.effective_message
+    if not chat or chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("❌ استخدم /settopic داخل Topic في الجروب المطلوب.")
+        return
+
+    thread_id = getattr(message, "message_thread_id", None)
+    if not thread_id:
+        await update.message.reply_text(
+            "❌ شغّل الأمر داخل موضوع (Topic) وليس داخل General."
+        )
+        return
+
+    raw_name = " ".join(context.args).strip()
+    if not raw_name:
+        await update.message.reply_text(
+            "اكتب اسم الموضوع، مثال:\n`/settopic 🎵 أغاني`",
+            parse_mode="Markdown",
+        )
+        return
+
+    register_group(chat.id, chat.title or "")
+    register_topic(chat.id, int(thread_id), raw_name)
+    set_last_topic(chat.id, int(thread_id))
+
+    await update.message.reply_text(
+        "✅ تم تسجيل الـTopic بنجاح.\n\n"
+        f"📂 {raw_name}\n"
+        f"🆔 Thread ID: `{thread_id}`",
+        parse_mode="Markdown",
+    )
+
+
+async def topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not await is_owner(update):
+        return
+
+    group_id = get_target_group_id()
+    if not group_id:
+        await update.message.reply_text("❌ لم يتم تحديد جروب الاستقبال بعد.")
+        return
+
+    topics = get_topics_for_group(group_id)
+    if not topics:
+        await update.message.reply_text(
+            "📂 لا توجد Topics مسجلة بعد.\n\n"
+            "ادخل كل Topic واكتب:\n"
+            "`/settopic اسم الموضوع`",
+            parse_mode="Markdown",
+        )
+        return
+
+    last = get_last_topic(group_id)
+    keyboard = []
+    for key, item in sorted(
+        topics.items(),
+        key=lambda kv: str(kv[1].get("name", "")),
+    ):
+        tid = int(key)
+        name = str(item.get("name") or key)
+        prefix = "✅ " if tid == last else "📂 "
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{prefix}{name}",
+                callback_data=f"topic_default:{tid}",
+            )
+        ])
+
+    await update.message.reply_text(
+        "📂 Topics المسجلة:\n\n"
+        "اضغط Topic لجعله الاختيار الافتراضي للفيديوهات القادمة.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 # =========================================================
 # Duplicate protection
 # =========================================================
@@ -598,7 +731,9 @@ async def set_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def get_video_key(info: Optional[dict], url: str) -> tuple[str, str]:
     if not info:
         return "", canonicalize_url(url)
-    platform = str(info.get("extractor_key") or info.get("extractor") or "").strip().lower()
+    platform = str(
+        info.get("extractor_key") or info.get("extractor") or ""
+    ).strip().lower()
     video_id = str(info.get("id") or "").strip()
     return platform, video_id or canonicalize_url(url)
 
@@ -613,16 +748,16 @@ def is_video_downloaded(platform: str, video_id: str, url: str) -> bool:
                 ).fetchone()
                 if row:
                     return True
+
             canonical = canonicalize_url(url)
             row = conn.execute(
                 "SELECT 1 FROM videos WHERE url=? LIMIT 1",
                 (canonical,),
             ).fetchone()
-            if row:
-                return True
+            return bool(row)
     except Exception as exc:
         logger.warning("Duplicate check failed: %s", exc)
-    return False
+        return False
 
 
 def save_downloaded_video(
@@ -633,14 +768,16 @@ def save_downloaded_video(
     file_hash: str = "",
 ) -> bool:
     try:
+        canonical = canonicalize_url(url)
         with db_connect() as conn:
             now = datetime.now().isoformat(timespec="seconds")
             conn.execute(
                 """
-                INSERT OR IGNORE INTO videos(platform, video_id, url, file_hash, title, downloaded_at)
+                INSERT OR IGNORE INTO videos
+                (platform, video_id, url, file_hash, title, downloaded_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (platform, video_id, canonicalize_url(url), file_hash, title, now),
+                (platform, video_id, canonical, file_hash, title, now),
             )
             conn.execute(
                 """
@@ -648,19 +785,24 @@ def save_downloaded_video(
                 SET url=?, file_hash=?, title=?, downloaded_at=?
                 WHERE platform=? AND video_id=?
                 """,
-                (canonicalize_url(url), file_hash, title, now, platform, video_id),
+                (canonical, file_hash, title, now, platform, video_id),
             )
             conn.commit()
         return True
-    except sqlite3.IntegrityError:
-        return False
     except Exception as exc:
         logger.warning("Could not save downloaded video: %s", exc)
         return False
 
 
 def create_pending_download(
-    user_id: int, chat_id: int, message_id: int, url: str, platform: str, video_id: str
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    url: str,
+    platform: str,
+    video_id: str,
+    topic_thread_id: Optional[int],
+    topic_name: str,
 ) -> str:
     token = hashlib.sha256(
         f"{user_id}:{chat_id}:{message_id}:{url}:{datetime.now().timestamp()}".encode()
@@ -670,30 +812,54 @@ def create_pending_download(
             conn.execute(
                 """
                 INSERT INTO pending_downloads
-                    (token, user_id, chat_id, message_id, url, platform, video_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (token, user_id, chat_id, message_id, url, platform, video_id, created_at,
+                 topic_thread_id, topic_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (token, str(user_id), str(chat_id), str(message_id), canonicalize_url(url),
-                 platform, video_id, datetime.now().isoformat(timespec="seconds")),
+                (
+                    token,
+                    str(user_id),
+                    str(chat_id),
+                    str(message_id),
+                    canonicalize_url(url),
+                    platform,
+                    video_id,
+                    datetime.now().isoformat(timespec="seconds"),
+                    topic_thread_id,
+                    topic_name,
+                ),
             )
             conn.commit()
+        return token
     except Exception as exc:
         logger.warning("Could not create pending download: %s", exc)
         return ""
-    return token
 
 
 def get_pending_download(token: str) -> Optional[dict]:
     try:
         with db_connect() as conn:
             row = conn.execute(
-                "SELECT user_id, chat_id, message_id, url, platform, video_id FROM pending_downloads WHERE token=?",
+                """
+                SELECT user_id, chat_id, message_id, url, platform, video_id,
+                       topic_thread_id, topic_name
+                FROM pending_downloads
+                WHERE token=?
+                """,
                 (token,),
             ).fetchone()
         if not row:
             return None
-        return {"user_id": int(row[0]), "chat_id": int(row[1]), "message_id": int(row[2]),
-                "url": row[3], "platform": row[4] or "", "video_id": row[5] or ""}
+        return {
+            "user_id": int(row[0]),
+            "chat_id": int(row[1]),
+            "message_id": int(row[2]),
+            "url": row[3],
+            "platform": row[4] or "",
+            "video_id": row[5] or "",
+            "topic_thread_id": int(row[6]) if row[6] is not None else None,
+            "topic_name": row[7] or "",
+        }
     except Exception as exc:
         logger.warning("Could not read pending download: %s", exc)
         return None
@@ -708,36 +874,9 @@ def delete_pending_download(token: str) -> None:
         pass
 
 
-def sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 # =========================================================
-# URL / site helpers
+# URL/site helpers
 # =========================================================
-
-
-def canonicalize_url(url: str) -> str:
-    """Remove common tracking parameters so equivalent share links match."""
-    url = normalize_url(url)
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        if not parsed.scheme or not parsed.netloc:
-            return url
-        tracking = {
-            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-            "fbclid", "igsh", "igshid", "si", "feature", "share_id",
-        }
-        query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-                 if k.lower() not in tracking and not k.lower().startswith("utm_")]
-        return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"),
-                                        urllib.parse.urlencode(query), ""))
-    except Exception:
-        return url
 
 
 def extract_url(text: str) -> Optional[str]:
@@ -789,27 +928,28 @@ def get_common_ydl_options() -> dict:
         "fragment_retries": 10,
         "extractor_retries": 3,
         "socket_timeout": 30,
+        "concurrent_fragment_downloads": 4,
         "http_headers": {
             "User-Agent": HTTP_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Referer": "https://www.google.com/",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
         },
     }
 
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
         options["cookiefile"] = COOKIES_FILE
 
-    # yt-dlp now uses external JS runtimes for full support on some sites,
-    # especially YouTube. Deno is preferred and is installed by the workflow.
+    # Deno is installed by the workflow for sites that require JavaScript execution.
     if shutil.which("deno"):
         options["js_runtimes"] = {"deno": {}}
 
-    # Let yt-dlp use browser impersonation when a site challenges non-browser
-    # clients. This is especially useful for modern social-media endpoints.
-    options["extractor_args"] = {"generic": {"impersonate": [""]}}
-    if os.getenv("YTDLP_IMPERSONATE", "1").strip().lower() in {"0", "false", "no"}:
-        options.pop("extractor_args", None)
+    # curl-cffi is supplied by yt-dlp[default,curl-cffi] in the current project.
+    # Use browser impersonation when the runtime supports it.
+    if os.getenv("YTDLP_IMPERSONATE", "1").strip().lower() not in {"0", "false", "no"}:
+        options["impersonate"] = "chrome"
 
     return options
 
@@ -820,6 +960,12 @@ def extract_info(url: str) -> Optional[dict]:
     base = get_common_ydl_options()
     attempts.append({**base, "skip_download": True})
     attempts.append({**base, "skip_download": True, "geo_bypass": True})
+
+    # A second pass without impersonation helps when a site's extractor rejects
+    # browser emulation for a particular endpoint.
+    plain = dict(base)
+    plain.pop("impersonate", None)
+    attempts.append({**plain, "skip_download": True})
 
     last_error = None
     for index, options in enumerate(attempts, 1):
@@ -844,7 +990,6 @@ def _estimate_format_size(fmt: dict, duration: Optional[float]) -> Optional[int]
             return int(value)
     tbr = fmt.get("tbr")
     if isinstance(tbr, (int, float)) and tbr > 0 and duration and duration > 0:
-        # tbr is kbps; leave a 10% overhead margin for estimation error.
         return int((float(tbr) * 1000 / 8) * duration * 1.10)
     return None
 
@@ -855,105 +1000,119 @@ def _format_score(fmt: dict) -> tuple:
     vcodec = str(fmt.get("vcodec") or "")
     acodec = str(fmt.get("acodec") or "")
     ext = str(fmt.get("ext") or "")
-    codec_bonus = 2 if "avc" in vcodec or "h264" in vcodec else 0
-    audio_bonus = 2 if "mp4a" in acodec or "aac" in acodec else 0
+    codec_bonus = 2 if any(x in vcodec.lower() for x in ("avc", "h264")) else 0
+    audio_bonus = 2 if any(x in acodec.lower() for x in ("mp4a", "aac")) else 0
     ext_bonus = 2 if ext == "mp4" else 0
     return height, fps, codec_bonus + audio_bonus + ext_bonus
 
 
 def choose_best_format(info: dict, target_bytes: int = SAFE_MAX_BYTES) -> tuple[Optional[str], dict]:
-    """Choose the highest-quality known/estimated format that should fit the target."""
-    formats = [f for f in (info.get("formats") or []) if f.get("vcodec") not in (None, "none")]
+    all_formats = info.get("formats") or []
     duration = info.get("duration")
 
-    # Prefer a single progressive format when its size is known.
-    candidates = []
-    for fmt in formats:
-        if fmt.get("acodec") in (None, "none"):
-            continue
+    progressive = [
+        f for f in all_formats
+        if f.get("vcodec") not in (None, "none")
+        and f.get("acodec") not in (None, "none")
+    ]
+    video_only = [
+        f for f in all_formats
+        if f.get("vcodec") not in (None, "none")
+        and f.get("acodec") in (None, "none")
+    ]
+    audio_only = [
+        f for f in all_formats
+        if f.get("vcodec") in (None, "none")
+        and f.get("acodec") not in (None, "none")
+    ]
+
+    candidates: list[tuple[dict, Optional[int], bool]] = []
+    for fmt in progressive:
         size = _estimate_format_size(fmt, duration)
         if size is not None:
             candidates.append((fmt, size, False))
 
-    # Separate video + audio: combine the best audio with each video stream.
-    audio_formats = [
-        f for f in formats
-        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
-    ]
-    # The filter above uses formats list; if it excluded audio-only, recover from all formats.
-    audio_formats = [
-        f for f in (info.get("formats") or [])
-        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
-    ]
-    audio_formats.sort(key=lambda f: _estimate_format_size(f, duration) or 10**18)
-    best_audio = audio_formats[0] if audio_formats else None
+    best_audio = None
+    if audio_only:
+        known_audio = [
+            (f, _estimate_format_size(f, duration))
+            for f in audio_only
+        ]
+        known_audio = [pair for pair in known_audio if pair[1] is not None]
+        if known_audio:
+            # Choose the smallest reliable audio stream that still has audio.
+            best_audio = min(known_audio, key=lambda pair: pair[1])[0]
 
     if best_audio:
-        audio_size = _estimate_format_size(best_audio, duration)
-        if audio_size is not None:
-            for fmt in formats:
-                if fmt.get("acodec") not in (None, "none"):
-                    continue
-                vsize = _estimate_format_size(fmt, duration)
-                if vsize is not None:
-                    candidates.append((fmt, vsize + audio_size, True))
-        else:
-            # If audio size is unknown, let yt-dlp choose the best compatible audio.
-            for fmt in formats:
-                if fmt.get("acodec") in (None, "none"):
-                    candidates.append((fmt, None, True))
+        audio_size = _estimate_format_size(best_audio, duration) or 0
+        for fmt in video_only:
+            vsize = _estimate_format_size(fmt, duration)
+            if vsize is not None:
+                candidates.append((fmt, vsize + audio_size, True))
 
     fitting = [item for item in candidates if item[1] is not None and item[1] <= target_bytes]
     if fitting:
         fitting.sort(key=lambda item: _format_score(item[0]), reverse=True)
         fmt, size, separate = fitting[0]
-        expression = f"{fmt['format_id']}+bestaudio/best" if separate else fmt["format_id"]
+        expression = (
+            f"{fmt['format_id']}+bestaudio/best"
+            if separate else fmt["format_id"]
+        )
         return expression, {
             "height": fmt.get("height"),
             "estimated_size": size,
             "format_id": fmt.get("format_id"),
             "separate": separate,
+            "direct_fit": True,
         }
 
-    # No format has a reliable size below target. Choose the best stream conservatively.
-    video_only = [f for f in formats if f.get("height")]
-    if video_only:
-        video_only.sort(key=_format_score, reverse=True)
-        chosen = video_only[0]
-        if chosen.get("acodec") not in (None, "none"):
-            expression = chosen["format_id"]
-            separate = False
-        else:
-            expression = f"{chosen['format_id']}+bestaudio/best"
-            separate = True
+    # No reliable known size fits: choose the best video and let compression handle it.
+    possible = [f for f in progressive + video_only if f.get("height")]
+    if possible:
+        possible.sort(key=_format_score, reverse=True)
+        chosen = possible[0]
+        separate = chosen.get("acodec") in (None, "none")
+        expression = (
+            f"{chosen['format_id']}+bestaudio/best"
+            if separate else chosen["format_id"]
+        )
         return expression, {
             "height": chosen.get("height"),
             "estimated_size": _estimate_format_size(chosen, duration),
             "format_id": chosen.get("format_id"),
             "separate": separate,
-            "fallback": True,
+            "direct_fit": False,
         }
 
     return None, {}
 
 
 def _find_downloaded_file(info: dict, ydl: yt_dlp.YoutubeDL) -> Optional[str]:
-    requested = info.get("requested_downloads") or []
-    for item in requested:
+    for item in info.get("requested_downloads") or []:
         path = item.get("filepath")
         if path and os.path.isfile(path):
             return path
 
     prepared = ydl.prepare_filename(info)
     stem = os.path.splitext(prepared)[0]
-    for candidate in (prepared, stem + ".mp4", stem + ".mkv", stem + ".webm", stem + ".mov"):
+    for candidate in (
+        prepared,
+        stem + ".mp4",
+        stem + ".mkv",
+        stem + ".webm",
+        stem + ".mov",
+    ):
         if os.path.isfile(candidate):
             return candidate
     return None
 
 
-def download_with_yt_dlp(url: str, output_template: str) -> tuple[Optional[str], Optional[dict], dict]:
-    info = extract_info(url)
+def download_with_yt_dlp(
+    url: str,
+    output_template: str,
+    preloaded_info: Optional[dict] = None,
+) -> tuple[Optional[str], Optional[dict], dict]:
+    info = preloaded_info or extract_info(url)
     if not info:
         return None, None, {}
 
@@ -974,15 +1133,24 @@ def download_with_yt_dlp(url: str, output_template: str) -> tuple[Optional[str],
         "noplaylist": True,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            downloaded_info = ydl.extract_info(url, download=True)
-            path = _find_downloaded_file(downloaded_info, ydl) if downloaded_info else None
-            if path:
-                return path, downloaded_info, selection
-    except Exception as exc:
-        logger.warning("yt-dlp download failed: %s", exc)
+    attempts = [options]
+    plain = dict(options)
+    plain.pop("impersonate", None)
+    attempts.append(plain)
 
+    last_error = None
+    for index, attempt_options in enumerate(attempts, 1):
+        try:
+            with yt_dlp.YoutubeDL(attempt_options) as ydl:
+                downloaded_info = ydl.extract_info(url, download=True)
+                path = _find_downloaded_file(downloaded_info, ydl) if downloaded_info else None
+                if path:
+                    return path, downloaded_info, selection
+        except Exception as exc:
+            last_error = exc
+            logger.warning("yt-dlp download attempt %s failed: %s", index, exc)
+
+    logger.warning("yt-dlp download failed after retries: %s", last_error)
     return None, info, selection
 
 
@@ -998,28 +1166,28 @@ def _looks_like_video_url(url: str, content_type: str = "") -> bool:
     return path.endswith((".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv", ".ts"))
 
 
-def download_direct_video(url: str, output_path: Path) -> Optional[str]:
+def download_direct_video(url: str, output_base: Path) -> Optional[str]:
     request = urllib.request.Request(
-        url,
+        canonicalize_url(url),
         headers={"User-Agent": HTTP_USER_AGENT, "Accept": "*/*"},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
+            final_url = response.geturl()
             content_type = response.headers.get("Content-Type", "")
-            if not _looks_like_video_url(response.geturl(), content_type):
+            if not _looks_like_video_url(final_url, content_type):
                 return None
 
             total = response.headers.get("Content-Length")
             if total:
                 try:
                     if int(total) > 2 * 1024 * 1024 * 1024:
-                        logger.warning("Direct video is larger than 2 GB; refusing early download")
                         return None
                 except ValueError:
                     pass
 
-            suffix = Path(urllib.parse.urlparse(response.geturl()).path).suffix or ".mp4"
-            target = output_path.with_suffix(suffix)
+            suffix = Path(urllib.parse.urlparse(final_url).path).suffix or ".mp4"
+            target = output_base.with_suffix(suffix)
             with target.open("wb") as handle:
                 while True:
                     chunk = response.read(1024 * 1024)
@@ -1070,7 +1238,6 @@ def get_video_duration(path: str) -> Optional[float]:
 def compress_video_to_limit(input_path: str) -> Optional[str]:
     if not ffmpeg_exists() or not os.path.isfile(input_path):
         return None
-
     if os.path.getsize(input_path) <= SAFE_MAX_BYTES:
         return input_path
 
@@ -1080,8 +1247,6 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
 
     source = Path(input_path)
     final_path = source.with_name(source.stem + "_telegram.mp4")
-
-    # Several targets make the operation robust when the first bitrate estimate overshoots.
     targets = [
         COMPRESSION_TARGET_BYTES,
         46 * 1024 * 1024,
@@ -1090,8 +1255,8 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
     ]
 
     for target_bytes in targets:
-        target_bits = target_bytes * 8
         audio_bps = 96_000
+        target_bits = target_bytes * 8
         video_bps = max(int(target_bits / duration - audio_bps), 120_000)
         bitrate_k = max(video_bps // 1000, 120)
 
@@ -1101,7 +1266,6 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
         except Exception:
             pass
 
-        # Keep the source aspect ratio and cap width at 720 for large videos.
         vf = "scale='min(720,iw)':-2:force_original_aspect_ratio=decrease"
         command = [
             "ffmpeg", "-y", "-i", str(source),
@@ -1116,7 +1280,6 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
             str(final_path),
         ]
 
-        logger.info("Compression attempt: target=%s, video_bitrate=%sk", human_size(target_bytes), bitrate_k)
         try:
             result = subprocess.run(
                 command,
@@ -1129,11 +1292,10 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
             continue
 
         if result.returncode != 0 or not final_path.exists():
-            logger.warning("FFmpeg failed: %s", result.stderr[-1500:])
+            logger.warning("FFmpeg failed: %s", result.stderr[-1200:])
             continue
 
         size = final_path.stat().st_size
-        logger.info("Compressed result: %s", human_size(size))
         if size <= SAFE_MAX_BYTES:
             return str(final_path)
 
@@ -1146,22 +1308,265 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
 
 
 def get_download_error_message(site_name: str) -> str:
-    cookie_hint = ""
-    if COOKIES_FILE:
-        cookie_hint = "\n• تم تفعيل Cookies؛ إذا استمر الفشل فالجلسة قد تكون منتهية."
-    elif site_name in {"Facebook", "Instagram", "TikTok", "YouTube"}:
-        cookie_hint = "\n• إذا كان المحتوى يحتاج تسجيل دخول، أضف Cookies صالحة عبر COOKIES_FILE."
-
+    cookies = (
+        "✅ Cookies configured. لو استمر الفشل فالجلسة قد تكون منتهية."
+        if COOKIES_FILE and Path(COOKIES_FILE).exists()
+        else "ℹ️ المحتوى المقيد قد يحتاج COOKIES_B64 / cookies.txt صالح."
+    )
     return (
         f"❌ لم أستطع استخراج فيديو {site_name}.\n\n"
-        "الأسباب الأقرب:\n"
+        "الأسباب المحتملة:\n"
         "• الرابط خاص أو يحتاج تسجيل دخول.\n"
-        "• الموقع غيّر طريقة الحماية/الاستخراج.\n"
-        "• جلسة Cookies غير موجودة أو منتهية.\n"
-        "• الفيديو غير متاح من سيرفر GitHub أو الرابط منتهي.\n\n"
-        "💡 البوت يستخدم أحدث yt-dlp مع browser impersonation، لكن المحتوى المقيد لا يمكن تجاوزه بدون جلسة صالحة."
-        f"{cookie_hint}"
+        "• الموقع رفض طلب السيرفر.\n"
+        "• الرابط منتهي أو يعيد التوجيه إلى محتوى غير متاح.\n"
+        "• طريقة الاستخراج تغيرت لدى الموقع.\n\n"
+        f"{cookies}"
     )
+
+
+# =========================================================
+# Topic selection UI
+# =========================================================
+
+
+def topic_keyboard(group_id: int) -> InlineKeyboardMarkup:
+    topics = get_topics_for_group(group_id)
+    last = get_last_topic(group_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    pending: list[InlineKeyboardButton] = []
+
+    for key, item in sorted(
+        topics.items(),
+        key=lambda kv: str(kv[1].get("name", "")),
+    ):
+        try:
+            tid = int(key)
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("name") or f"موضوع {tid}")
+        mark = "✅ " if last == tid else ""
+        pending.append(
+            InlineKeyboardButton(
+                f"{mark}{name}",
+                callback_data=f"topic_select:{tid}",
+            )
+        )
+        if len(pending) == 2:
+            rows.append(pending)
+            pending = []
+    if pending:
+        rows.append(pending)
+
+    rows.append([
+        InlineKeyboardButton("⚙️ إدارة الـTopics", callback_data="show_topics")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_topic_picker(query_or_message, group_id: int, edit: bool = False):
+    topics = get_topics_for_group(group_id)
+    if not topics:
+        text = (
+            "❌ لا توجد Topics مسجلة للبوت بعد.\n\n"
+            "ادخل كل Topic واكتب داخله:\n"
+            "`/settopic اسم الموضوع`\n\n"
+            "مثال:\n"
+            "`/settopic 🎵 أغاني`"
+        )
+        if edit:
+            await query_or_message.edit_message_text(text, parse_mode="Markdown")
+        else:
+            await query_or_message.reply_text(text, parse_mode="Markdown")
+        return
+
+    text = "📂 اختر المكان الذي تريد حفظ الفيديو فيه:"
+    if edit:
+        await query_or_message.edit_message_text(
+            text,
+            reply_markup=topic_keyboard(group_id),
+        )
+    else:
+        await query_or_message.reply_text(
+            text,
+            reply_markup=topic_keyboard(group_id),
+        )
+
+
+# =========================================================
+# Album queue
+# =========================================================
+
+
+def _album_key(chat_id: int, thread_id: Optional[int]) -> str:
+    return f"{chat_id}:{thread_id or 0}"
+
+
+async def _send_album(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: Optional[int],
+    topic_name: str,
+    items: list[dict],
+):
+    if not items:
+        return
+
+    # Telegram media groups contain 2-10 items; the project uses 4.
+    if len(items) == 1:
+        item = items[0]
+        path = item["path"]
+        try:
+            with open(path, "rb") as handle:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    video=handle,
+                    caption=item.get("caption", ""),
+                    supports_streaming=True,
+                    protect_content=PROTECT_CONTENT,
+                    read_timeout=180,
+                    write_timeout=180,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+        except Exception:
+            try:
+                with open(path, "rb") as handle:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        document=handle,
+                        caption=item.get("caption", ""),
+                        protect_content=PROTECT_CONTENT,
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
+            except Exception:
+                logger.exception("Single-item album fallback failed")
+        finally:
+            cleanup_download_files(item.get("cleanup_prefix", ""))
+        return
+
+    handles = []
+    media = []
+    try:
+        for index, item in enumerate(items):
+            handle = open(item["path"], "rb")
+            handles.append(handle)
+            media.append(
+                InputMediaVideo(
+                    media=handle,
+                    caption=item.get("caption", "") if index == 0 else None,
+                    supports_streaming=True,
+                )
+            )
+
+        await context.bot.send_media_group(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            media=media,
+            protect_content=PROTECT_CONTENT,
+            read_timeout=180,
+            write_timeout=180,
+            connect_timeout=30,
+            pool_timeout=30,
+        )
+    except Exception as exc:
+        logger.warning("send_media_group failed in topic %s: %s", topic_name, exc)
+        # Fallback: keep the videos usable even if album sending is rejected.
+        for item in items:
+            try:
+                with open(item["path"], "rb") as handle:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        video=handle,
+                        caption=item.get("caption", ""),
+                        supports_streaming=True,
+                        protect_content=PROTECT_CONTENT,
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
+            except Exception:
+                logger.exception("Album individual fallback failed")
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        for item in items:
+            cleanup_download_files(item.get("cleanup_prefix", ""))
+
+
+async def _flush_album_after_delay(
+    context: ContextTypes.DEFAULT_TYPE,
+    key: str,
+):
+    try:
+        await asyncio.sleep(ALBUM_FLUSH_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    async with ALBUM_LOCK:
+        items = ALBUM_QUEUES.pop(key, [])
+        ALBUM_TASKS.pop(key, None)
+
+    if not items:
+        return
+
+    chat_id = int(key.split(":", 1)[0])
+    thread_raw = key.split(":", 1)[1]
+    thread_id = int(thread_raw) if thread_raw != "0" else None
+    topic_name = items[0].get("topic_name", "")
+
+    await _send_album(context, chat_id, thread_id, topic_name, items)
+
+
+async def enqueue_for_album(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: Optional[int],
+    topic_name: str,
+    path: str,
+    caption: str,
+    cleanup_prefix: str,
+) -> None:
+    key = _album_key(chat_id, thread_id)
+    ready_items = None
+
+    async with ALBUM_LOCK:
+        queue = ALBUM_QUEUES.setdefault(key, [])
+        queue.append(
+            {
+                "path": path,
+                "caption": caption,
+                "topic_name": topic_name,
+                "cleanup_prefix": cleanup_prefix,
+            }
+        )
+
+        old_task = ALBUM_TASKS.pop(key, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        if len(queue) >= ALBUM_SIZE:
+            ready_items = ALBUM_QUEUES.pop(key, [])[:ALBUM_SIZE]
+            # Any accidental extra items remain queued.
+            extras = queue[ALBUM_SIZE:]
+            if extras:
+                ALBUM_QUEUES[key] = extras
+        else:
+            ALBUM_TASKS[key] = asyncio.create_task(
+                _flush_album_after_delay(context, key)
+            )
+
+    if ready_items:
+        await _send_album(context, chat_id, thread_id, topic_name, ready_items)
 
 
 # =========================================================
@@ -1169,12 +1574,32 @@ def get_download_error_message(site_name: str) -> str:
 # =========================================================
 
 
-async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, status_msg, force_download: bool = False, known_key: Optional[tuple[str, str]] = None):
+async def process_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    status_msg,
+    topic_thread_id: Optional[int],
+    topic_name: str,
+    force_download: bool = False,
+    known_key: Optional[tuple[str, str]] = None,
+):
     site_name = get_site_name(url)
     user_id = update.effective_user.id if update.effective_user else 0
-    message_id = update.message.message_id if update.message else 0
-    prefix = f"video_{user_id}_{message_id}"
+    source_message = update.message or (
+        update.callback_query.message if update.callback_query else None
+    )
+    message_id = source_message.message_id if source_message else int(datetime.now().timestamp())
+    prefix = f"video_{user_id}_{message_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}"
     output_template = str(DOWNLOAD_DIR / f"{prefix}.%(ext)s")
+
+    target_group_id = get_target_group_id()
+    if not target_group_id:
+        await status_msg.edit_text(
+            "❌ لم يتم تحديد جروب الاستقبال.\n\n"
+            "استخدم /setgroup داخل الجروب المطلوب أولًا."
+        )
+        return
 
     async with JOB_SEMAPHORE:
         loop = asyncio.get_running_loop()
@@ -1183,32 +1608,46 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         selection = {}
 
         try:
-            await status_msg.edit_text(f"🔎 جاري تحليل رابط {site_name}...\n\nأبحث عن أعلى جودة يمكن إرسالها تحت {SAFE_MAX_BYTES / 1024 / 1024:.0f} MB.")
+            await status_msg.edit_text(
+                f"🔎 جاري تحليل رابط {site_name}...\n\n"
+                f"📂 المكان: {topic_name}\n"
+                f"📦 الحد الآمن: {SAFE_MAX_BYTES // (1024 * 1024)} MB"
+            )
 
             info = await loop.run_in_executor(None, extract_info, url)
-            platform = ""
-            video_id = canonicalize_url(url)
-            if info:
-                platform, video_id = get_video_key(info, url)
-            elif known_key:
+            platform, video_id = get_video_key(info, url)
+            if not info and known_key:
                 platform, video_id = known_key
 
             if not force_download and is_video_downloaded(platform, video_id, url):
                 owner_id = update.effective_user.id if update.effective_user else 0
                 chat_id = update.effective_chat.id if update.effective_chat else 0
-                source_message_id = (
-                    update.message.message_id if update.message
-                    else (update.callback_query.message.message_id if update.callback_query and update.callback_query.message else 0)
+                source_message_id = source_message.message_id if source_message else 0
+                token = create_pending_download(
+                    owner_id,
+                    chat_id,
+                    source_message_id,
+                    url,
+                    platform,
+                    video_id,
+                    topic_thread_id,
+                    topic_name,
                 )
-                token = create_pending_download(owner_id, chat_id, source_message_id, url, platform, video_id)
                 keyboard = []
                 if token:
                     keyboard = [[
-                        InlineKeyboardButton("🔄 تحميل مرة أخرى", callback_data=f"download_again:{token}"),
-                        InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_download:{token}"),
+                        InlineKeyboardButton(
+                            "🔄 تحميل مرة أخرى",
+                            callback_data=f"download_again:{token}",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ إلغاء",
+                            callback_data=f"cancel_download:{token}",
+                        ),
                     ]]
                 await status_msg.edit_text(
                     "⚠️ هذا الفيديو تم تحميله وإرساله من قبل.\n\n"
+                    f"📂 الموضوع: {topic_name}\n\n"
                     "هل تريد تحميله مرة أخرى؟",
                     reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
                 )
@@ -1216,19 +1655,24 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
 
             await status_msg.edit_text(
                 "⬇️ جاري التحميل بأفضل جودة مناسبة للحجم...\n"
-                "إذا لم توجد جودة تحت الحد، سأضغط الفيديو تلقائيًا."
+                "إذا لم توجد جودة تحت 48 MB سأضغط الفيديو تلقائيًا."
             )
 
             if info:
                 file_path, final_info, selection = await loop.run_in_executor(
-                    None, download_with_yt_dlp, url, output_template
+                    None,
+                    download_with_yt_dlp,
+                    url,
+                    output_template,
+                    info,
                 )
 
-            # Direct-file fallback for plain MP4/WebM/etc. URLs.
             if not file_path:
-                direct_base = DOWNLOAD_DIR / prefix
                 file_path = await loop.run_in_executor(
-                    None, download_direct_video, url, direct_base
+                    None,
+                    download_direct_video,
+                    url,
+                    DOWNLOAD_DIR / prefix,
                 )
 
             if not file_path or not os.path.isfile(file_path):
@@ -1236,16 +1680,15 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
                 return
 
             file_size = os.path.getsize(file_path)
-            logger.info("Downloaded %s: %s", human_size(file_size), file_path)
-
-            # If the chosen stream exceeded the limit, compress rather than fail.
             if file_size > SAFE_MAX_BYTES:
                 await status_msg.edit_text(
-                    f"🗜️ الحجم الحالي {human_size(file_size)} أكبر من الحد.\n"
-                    "جاري ضغط الفيديو تلقائيًا مع الحفاظ على أعلى جودة ممكنة..."
+                    f"🗜️ الحجم الحالي {human_size(file_size)} أكبر من 48 MB.\n"
+                    "جاري الضغط تلقائيًا..."
                 )
                 compressed = await loop.run_in_executor(
-                    None, compress_video_to_limit, file_path
+                    None,
+                    compress_video_to_limit,
+                    file_path,
                 )
                 if not compressed:
                     await status_msg.edit_text(
@@ -1269,96 +1712,49 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
             if title:
                 caption += f"\n\n{title}"
 
-            target_group_id = get_target_group_id()
-            if not target_group_id:
-                await status_msg.edit_text(
-                    "❌ لم يتم تحديد جروب الاستقبال.\n\n"
-                    "أدخل البوت إلى الجروب المطلوب ثم استخدم /setgroup داخله، "
-                    "أو استخدم /admin لتغيير الجروب المحفوظ."
-                )
-                return
-
-            try:
-                target_chat = await context.bot.get_chat(target_group_id)
-                if target_chat.type not in ("group", "supergroup", "channel"):
-                    await status_msg.edit_text("❌ جروب الاستقبال المحفوظ غير صالح.")
-                    return
-            except Exception as exc:
-                logger.warning("Could not access target group %s: %s", target_group_id, exc)
-                await status_msg.edit_text(
-                    "❌ لا أستطيع الوصول إلى جروب الاستقبال المحفوظ.\n"
-                    "تأكد أن البوت ما زال عضوًا فيه."
-                )
-                return
-
-            await status_msg.edit_text(
-                f"📤 جاري إرسال الفيديو...\n📦 الحجم النهائي: {human_size(file_size)}"
-            )
-
-            sent = False
-            try:
-                with open(file_path, "rb") as video_file:
-                    await context.bot.send_video(
-                        chat_id=target_group_id,
-                        video=video_file,
-                        caption=caption,
-                        supports_streaming=True,
-                        read_timeout=180,
-                        write_timeout=180,
-                        connect_timeout=30,
-                        pool_timeout=30,
-                    )
-                sent = True
-            except Exception as exc:
-                logger.warning("send_video failed: %s", exc)
-
-            if not sent:
-                try:
-                    with open(file_path, "rb") as video_file:
-                        await context.bot.send_document(
-                            chat_id=target_group_id,
-                            document=video_file,
-                            caption=caption,
-                            read_timeout=180,
-                            write_timeout=180,
-                            connect_timeout=30,
-                            pool_timeout=30,
-                        )
-                    sent = True
-                except Exception as exc:
-                    logger.exception("send_document failed: %s", exc)
-
-            if not sent:
-                await status_msg.edit_text(
-                    "❌ تم تحميل الفيديو وتجهيزه، لكن Telegram رفض الإرسال إلى الجروب.\n"
-                    "تأكد أن البوت عضو في الجروب ولديه صلاحية إرسال الفيديوهات والملفات."
-                )
-                return
-
+            # Save duplicate record before album send only after file is proven valid;
+            # this prevents a successful re-queue from being mistaken for a failure.
             file_hash = await loop.run_in_executor(None, sha256_file, file_path)
             save_downloaded_video(platform, video_id, url, title, file_hash)
 
             selected_height = selection.get("height")
             quality_text = f"{int(selected_height)}p" if selected_height else "أفضل جودة متاحة"
+
+            # The temporary status message is updated; the final media is queued.
             await status_msg.edit_text(
-                "✅ تم التحميل والإرسال بنجاح.\n\n"
+                "✅ تم تجهيز الفيديو.\n\n"
                 f"🌐 المصدر: {site_name}\n"
-                f"📐 الجودة المختارة: {quality_text}\n"
-                f"📦 الحجم النهائي: {human_size(file_size)}\n"
-                f"📤 الجروب: {target_chat.title or target_group_id}"
+                f"📂 الموضوع: {topic_name}\n"
+                f"📐 الجودة: {quality_text}\n"
+                f"📦 الحجم: {human_size(file_size)}\n\n"
+                f"📦 تمت إضافته إلى Album من {ALBUM_SIZE} فيديوهات.\n"
+                f"⏱️ لو لم يكتمل العدد خلال {ALBUM_FLUSH_SECONDS} ثانية سيتم إرسال الموجود."
             )
+
+            await enqueue_for_album(
+                context=context,
+                chat_id=target_group_id,
+                thread_id=topic_thread_id,
+                topic_name=topic_name,
+                path=file_path,
+                caption=caption,
+                cleanup_prefix=prefix,
+            )
+            file_path = None  # queue now owns cleanup
 
         except Exception as exc:
             logger.exception("Processing error: %s", exc)
             try:
                 await status_msg.edit_text(
                     "⚠️ حدث خطأ غير متوقع أثناء معالجة الفيديو.\n"
-                    "راجع Logs السيرفر لمعرفة التفاصيل."
+                    "راجع Logs الـActions للتفاصيل."
                 )
             except Exception:
                 pass
         finally:
-            cleanup_download_files(prefix)
+            # Do not clean a file that has been handed to the album queue.
+            if file_path:
+                cleanup_download_files(prefix)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1372,35 +1768,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url:
         return
 
-    try:
-        status_msg = await update.message.reply_text(
-            f"🔎 استلمت الرابط ({get_site_name(url)}). جاري البدء..."
+    target_group_id = get_target_group_id()
+    if not target_group_id:
+        await update.message.reply_text(
+            "❌ لم يتم تحديد جروب الاستقبال.\n"
+            "استخدم /setgroup داخل الجروب المطلوب."
         )
-    except Exception:
         return
 
-    await process_url(update, context, url, status_msg)
+    status_msg = await update.message.reply_text("📂 جاري فتح قائمة Topics...")
+    # Store the URL against the picker/status message itself, because callback queries
+    # point to that message rather than the original user message.
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO settings(key, value)
+                VALUES(?, ?)
+                """,
+                (f"topic_picker_url:{status_msg.message_id}", canonicalize_url(url)),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Could not store topic picker URL: %s", exc)
+    await show_topic_picker(status_msg, target_group_id, edit=True)
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+async def _get_picker_url(message_id: int) -> Optional[str]:
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key=? LIMIT 1",
+                (f"topic_picker_url:{message_id}",),
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+    except Exception:
+        pass
+    return None
+
+
+async def _delete_picker_url(message_id: int) -> None:
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "DELETE FROM settings WHERE key=?",
+                (f"topic_picker_url:{message_id}",),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+# =========================================================
+# Callbacks
+# =========================================================
+
+
+async def duplicate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
         return
     if not await is_owner(update):
-        await update.message.reply_text("⛔ هذا البوت خاص بالمالك فقط.")
-        return
-    await update.message.reply_text(
-        "👋 البوت جاهز.\n\n"
-        "أرسل أي رابط فيديو وسأختار أعلى جودة مناسبة تحت 48 MB.\n\n"
-        "/admin — اختيار جروب الاستقبال\n"
-        "/setgroup — تعيين الجروب الحالي مباشرة"
-    )
-
-
-async def download_duplicate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query or not await is_owner(update):
-        if query:
-            await query.answer("⛔ غير مسموح لك.", show_alert=True)
+        await query.answer("⛔ غير مسموح لك.", show_alert=True)
         return
 
     data = query.data or ""
@@ -1409,22 +1839,226 @@ async def download_duplicate_callback(update: Update, context: ContextTypes.DEFA
     if not pending:
         await query.answer("انتهت صلاحية الطلب.", show_alert=True)
         return
-    if pending["user_id"] != update.effective_user.id:
+    if update.effective_user.id != pending["user_id"]:
         await query.answer("⛔ هذا الطلب ليس لك.", show_alert=True)
         return
 
     await query.answer()
+    delete_pending_download(token)
+
     if data.startswith("cancel_download:"):
-        delete_pending_download(token)
         await query.edit_message_text("❌ تم إلغاء إعادة التحميل.")
         return
 
-    delete_pending_download(token)
-    await query.edit_message_text("🔄 تم اختيار إعادة التحميل...\nجاري بدء العملية من جديد.")
+    await query.edit_message_text(
+        "🔄 تم اختيار إعادة التحميل...\n"
+        f"📂 الموضوع: {pending['topic_name']}\n"
+        "جاري البدء من جديد."
+    )
     await process_url(
-        update, context, pending["url"], query.message,
+        update,
+        context,
+        pending["url"],
+        query.message,
+        topic_thread_id=pending["topic_thread_id"],
+        topic_name=pending["topic_name"],
         force_download=True,
         known_key=(pending["platform"], pending["video_id"]),
+    )
+
+
+async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not await is_owner(update):
+        await query.answer("⛔ غير مسموح لك.", show_alert=True)
+        return
+
+    data = query.data or ""
+
+    if data == "show_topics":
+        group_id = get_target_group_id()
+        await query.answer()
+        if not group_id:
+            await query.edit_message_text("❌ لم يتم تحديد جروب الاستقبال.")
+            return
+        await show_topic_picker(query, group_id, edit=True)
+        return
+
+    if data.startswith("topic_select:"):
+        try:
+            thread_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await query.answer("Topic غير صالح.", show_alert=True)
+            return
+
+        group_id = get_target_group_id()
+        if not group_id:
+            await query.answer("لم يتم تحديد الجروب.", show_alert=True)
+            return
+
+        topic_name = get_topic_name(group_id, thread_id)
+        set_last_topic(group_id, thread_id)
+
+        # The status message is the one directly below/created for the user's URL.
+        source_message_id = query.message.message_id
+        url = await _get_picker_url(source_message_id)
+
+        if not url:
+            await query.answer("انتهت صلاحية رابط الفيديو.", show_alert=True)
+            return
+
+        await _delete_picker_url(source_message_id)
+        await query.answer(f"تم اختيار: {topic_name}")
+        await query.edit_message_text(
+            f"📂 تم اختيار: {topic_name}\n\n🔎 جاري بدء التحميل..."
+        )
+        await process_url(
+            update,
+            context,
+            url,
+            query.message,
+            topic_thread_id=thread_id,
+            topic_name=topic_name,
+        )
+        return
+
+    if data.startswith("topic_default:"):
+        try:
+            thread_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await query.answer("Topic غير صالح.", show_alert=True)
+            return
+        group_id = get_target_group_id()
+        if not group_id:
+            await query.answer("لم يتم تحديد الجروب.", show_alert=True)
+            return
+        set_last_topic(group_id, thread_id)
+        await query.answer("✅ تم حفظ الاختيار الافتراضي.")
+        await query.edit_message_text(
+            f"✅ الـTopic الافتراضي أصبح:\n\n📂 {get_topic_name(group_id, thread_id)}"
+        )
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not await is_owner(update):
+        await query.answer("⛔ غير مسموح لك.", show_alert=True)
+        return
+
+    data = query.data or ""
+    await query.answer()
+
+    if data in {"refresh_admin", "current_group"}:
+        current = get_target_group_id()
+        title = "غير معروف"
+        if current:
+            try:
+                chat = await context.bot.get_chat(current)
+                title = chat.title or title
+            except Exception:
+                pass
+        await query.edit_message_text(
+            "📍 جروب الاستقبال الحالي:\n\n"
+            f"🏷️ الاسم: {title}\n"
+            f"🆔 ID: `{current or 'غير محدد'}`\n\n"
+            "استخدم /admin لعرض القائمة.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "show_topics":
+        group_id = get_target_group_id()
+        if not group_id:
+            await query.edit_message_text("❌ لم يتم تحديد جروب الاستقبال.")
+            return
+        topics = get_topics_for_group(group_id)
+        if not topics:
+            await query.edit_message_text(
+                "📂 لا توجد Topics مسجلة.\n\n"
+                "ادخل كل Topic واكتب `/settopic اسم الموضوع`."
+            )
+            return
+        lines = ["📂 Topics المسجلة:\n"]
+        for key, item in sorted(topics.items(), key=lambda kv: str(kv[1].get("name", ""))):
+            lines.append(f"• {item.get('name')} — `{key}`")
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if data == "register_current_group":
+        chat = update.effective_chat
+        if not chat or chat.type not in ("group", "supergroup"):
+            await query.edit_message_text("📌 اضغط التسجيل من داخل الجروب المطلوب.")
+            return
+        if register_group(chat.id, chat.title or ""):
+            await query.edit_message_text(
+                "✅ تم تسجيل الجروب.\n\n"
+                f"🏷️ {chat.title or 'بدون اسم'}\n"
+                f"🆔 `{chat.id}`\n\n"
+                "استخدم /admin لاختياره."
+            )
+        else:
+            await query.edit_message_text("❌ تعذر التسجيل.")
+        return
+
+    if data.startswith("select_group:"):
+        try:
+            group_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ معرف الجروب غير صحيح.")
+            return
+
+        registered_ids = set()
+        for raw_id, _ in get_registered_groups():
+            try:
+                registered_ids.add(int(raw_id))
+            except ValueError:
+                pass
+        if group_id not in registered_ids:
+            await query.edit_message_text("❌ هذا الجروب غير مسجل.")
+            return
+
+        try:
+            chat = await context.bot.get_chat(group_id)
+        except Exception:
+            await query.edit_message_text(
+                "❌ لا أستطيع الوصول إلى الجروب. تأكد أن البوت موجود داخله."
+            )
+            return
+
+        if set_target_group_id(group_id, chat.title or ""):
+            await query.edit_message_text(
+                "✅ تم تغيير جروب الاستقبال وحفظه.\n\n"
+                f"🏷️ {chat.title or 'غير معروف'}\n"
+                f"🆔 `{group_id}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.edit_message_text("❌ تعذر حفظ الجروب.")
+
+
+# =========================================================
+# Start + error handling
+# =========================================================
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not await is_owner(update):
+        await update.message.reply_text("⛔ هذا البوت خاص بالمالك فقط.")
+        return
+
+    await update.message.reply_text(
+        "👋 البوت جاهز.\n\n"
+        "أرسل رابط فيديو، وبعدها اختر الـTopic يدويًا.\n\n"
+        "/admin — إدارة الجروب\n"
+        "/setgroup — تعيين الجروب الحالي\n"
+        "/settopic — تسجيل Topic من داخله\n"
+        "/topics — إدارة الـTopics"
     )
 
 
@@ -1448,15 +2082,41 @@ def main():
     logger.info("FFmpeg: %s", "OK" if ffmpeg_exists() else "MISSING")
     logger.info("ffprobe: %s", "OK" if ffprobe_exists() else "MISSING")
     logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
-    logger.info("Cookies: %s", "configured" if COOKIES_FILE and Path(COOKIES_FILE).exists() else "not configured")
-    logger.info("GitHub persistent state: %s", "enabled" if GITHUB_TOKEN and GITHUB_REPO else "disabled")
+    logger.info(
+        "Cookies: %s",
+        "configured" if COOKIES_FILE and Path(COOKIES_FILE).exists() else "not configured",
+    )
+    logger.info(
+        "GitHub persistent state: %s",
+        "enabled" if GITHUB_TOKEN and GITHUB_REPO else "disabled",
+    )
+    logger.info("Album size: %s | flush: %ss", ALBUM_SIZE, ALBUM_FLUSH_SECONDS)
+    logger.info("Protect content: %s", PROTECT_CONTENT)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("setgroup", set_group_command))
-    app.add_handler(CallbackQueryHandler(download_duplicate_callback, pattern=r"^(download_again|cancel_download):"))
-    app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(CommandHandler("settopic", set_topic_command))
+    app.add_handler(CommandHandler("topics", topics_command))
+
+    app.add_handler(
+        CallbackQueryHandler(
+            duplicate_callback,
+            pattern=r"^(download_again|cancel_download):",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            topic_callback,
+            pattern=r"^(topic_select|topic_default|show_topics):?",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(admin_callback)
+    )
+
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
