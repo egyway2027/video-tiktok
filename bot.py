@@ -56,8 +56,8 @@ JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Album settings requested by the owner.
 ALBUM_SIZE = 3
-# No timer: videos stay queued until exactly 3 videos are ready for the same Topic.
-
+# Album waits until 3 videos exist in the same topic. No timeout flush.
+ALBUM_FLUSH_SECONDS = 0
 
 # Set PROTECT_CONTENT=1 to prevent forwarding/saving of bot-sent media.
 # This does NOT make a group message invisible to selected members; Telegram does
@@ -92,6 +92,7 @@ logger = logging.getLogger(__name__)
 
 # queue key = "chat_id:thread_id"
 ALBUM_QUEUES: dict[str, list[dict]] = {}
+ALBUM_TASKS: dict[str, asyncio.Task] = {}
 ALBUM_LOCK = asyncio.Lock()
 
 
@@ -670,8 +671,13 @@ async def set_topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    register_group(chat.id, chat.title or "")
-    register_topic(chat.id, int(thread_id), raw_name)
+    # The group where /settopic is executed is the real receiving group.
+    if not register_group(chat.id, chat.title or ""):
+        await update.message.reply_text("❌ تعذر تسجيل الجروب."); return
+    if not set_target_group_id(chat.id, chat.title or ""):
+        await update.message.reply_text("❌ تعذر تعيين هذا الجروب كجروب الاستقبال."); return
+    if not register_topic(chat.id, int(thread_id), raw_name):
+        await update.message.reply_text("❌ تعذر تسجيل الـTopic."); return
     set_last_topic(chat.id, int(thread_id))
 
     await update.message.reply_text(
@@ -897,27 +903,11 @@ def resolve_social_share_url(url: str) -> str:
         logger.info("Share resolve failed %s: %s", url, exc)
     return url
 
-def extract_urls(text: str) -> list[str]:
-    """Extract every URL from a Telegram message, preserving message order."""
-    if not text:
-        return []
-
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in URL_REGEX.finditer(text):
-        url = resolve_social_share_url(normalize_url(match.group(0)))
-        url = canonicalize_url(url)
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        urls.append(url)
-    return urls
-
-
 def extract_url(text: str) -> Optional[str]:
-    """Backward-compatible helper: return the first URL only."""
-    urls = extract_urls(text)
-    return urls[0] if urls else None
+    if not text:
+        return None
+    match = URL_REGEX.search(text)
+    return resolve_social_share_url(normalize_url(match.group(0))) if match else None
 
 
 def get_site_name(url: str) -> str:
@@ -1401,6 +1391,13 @@ def topic_keyboard(group_id: int) -> InlineKeyboardMarkup:
 
 async def show_topic_picker(query_or_message, group_id: int, edit: bool = False):
     topics = get_topics_for_group(group_id)
+
+    async def _edit_message(text: str, reply_markup=None):
+        if hasattr(query_or_message, "edit_message_text"):
+            await query_or_message.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        else:
+            await query_or_message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
     if not topics:
         text = (
             "❌ لا توجد Topics مسجلة للبوت بعد.\n\n"
@@ -1410,22 +1407,16 @@ async def show_topic_picker(query_or_message, group_id: int, edit: bool = False)
             "`/settopic 🎵 أغاني`"
         )
         if edit:
-            await query_or_message.edit_message_text(text, parse_mode="Markdown")
+            await _edit_message(text)
         else:
             await query_or_message.reply_text(text, parse_mode="Markdown")
         return
 
     text = "📂 اختر المكان الذي تريد حفظ الفيديو فيه:"
     if edit:
-        await query_or_message.edit_message_text(
-            text,
-            reply_markup=topic_keyboard(group_id),
-        )
+        await _edit_message(text, reply_markup=topic_keyboard(group_id))
     else:
-        await query_or_message.reply_text(
-            text,
-            reply_markup=topic_keyboard(group_id),
-        )
+        await query_or_message.reply_text(text, reply_markup=topic_keyboard(group_id))
 
 
 # =========================================================
@@ -1443,11 +1434,11 @@ async def _send_album(
     thread_id: Optional[int],
     topic_name: str,
     items: list[dict],
-) -> bool:
+):
     if not items:
-        return False
+        return
 
-    # Telegram media groups contain 2-10 items; this project sends exactly 3 per album.
+    # Telegram media groups contain 2-10 items; the project uses 4.
     if len(items) == 1:
         item = items[0]
         path = item["path"]
@@ -1483,7 +1474,7 @@ async def _send_album(
                 logger.exception("Single-item album fallback failed")
         finally:
             cleanup_download_files(item.get("cleanup_prefix", ""))
-        return False
+        return
 
     handles = []
     media = []
@@ -1509,7 +1500,6 @@ async def _send_album(
             connect_timeout=30,
             pool_timeout=30,
         )
-        return True
     except Exception as exc:
         logger.warning("send_media_group failed in topic %s: %s", topic_name, exc)
         # Fallback: keep the videos usable even if album sending is rejected.
@@ -1539,7 +1529,29 @@ async def _send_album(
         for item in items:
             cleanup_download_files(item.get("cleanup_prefix", ""))
 
-    return False
+
+async def _flush_album_after_delay(
+    context: ContextTypes.DEFAULT_TYPE,
+    key: str,
+):
+    try:
+        await asyncio.sleep(ALBUM_FLUSH_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    async with ALBUM_LOCK:
+        items = ALBUM_QUEUES.pop(key, [])
+        ALBUM_TASKS.pop(key, None)
+
+    if not items:
+        return
+
+    chat_id = int(key.split(":", 1)[0])
+    thread_raw = key.split(":", 1)[1]
+    thread_id = int(thread_raw) if thread_raw != "0" else None
+    topic_name = items[0].get("topic_name", "")
+
+    await _send_album(context, chat_id, thread_id, topic_name, items)
 
 
 async def enqueue_for_album(
@@ -1551,9 +1563,8 @@ async def enqueue_for_album(
     caption: str,
     cleanup_prefix: str,
 ) -> None:
-    """Queue one completed video and send only when 3 exist for this Topic."""
     key = _album_key(chat_id, thread_id)
-    ready_items: Optional[list[dict]] = None
+    ready_items = None
 
     async with ALBUM_LOCK:
         queue = ALBUM_QUEUES.setdefault(key, [])
@@ -1566,36 +1577,23 @@ async def enqueue_for_album(
             }
         )
 
+        old_task = ALBUM_TASKS.pop(key, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
         if len(queue) >= ALBUM_SIZE:
-            ready_items = queue[:ALBUM_SIZE]
-            remaining = queue[ALBUM_SIZE:]
-            if remaining:
-                ALBUM_QUEUES[key] = remaining
-            else:
-                ALBUM_QUEUES.pop(key, None)
+            ready_items = ALBUM_QUEUES.pop(key, [])[:ALBUM_SIZE]
+            # Any accidental extra items remain queued.
+            extras = queue[ALBUM_SIZE:]
+            if extras:
+                ALBUM_QUEUES[key] = extras
+        else:
+            # Keep waiting until this exact topic reaches ALBUM_SIZE videos.
+            # No timer is created, so topics are never mixed or flushed early.
+            pass
 
     if ready_items:
-        album_sent = await _send_album(
-            context, chat_id, thread_id, topic_name, ready_items
-        )
-        try:
-            if album_sent:
-                text = (
-                    f"✅ تم إرسال الـ{ALBUM_SIZE} فيديوهات إلى ألبوم «{topic_name}» بنجاح."
-                )
-            else:
-                text = (
-                    f"⚠️ تم تجهيز الـ{ALBUM_SIZE} فيديوهات، لكن تعذر إرسالها كألبوم. "
-                    "تم استخدام الإرسال الفردي كحل بديل."
-                )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                text=text,
-                protect_content=PROTECT_CONTENT,
-            )
-        except Exception:
-            logger.exception("Could not send album confirmation for topic %s", topic_name)
+        await _send_album(context, chat_id, thread_id, topic_name, ready_items)
 
 
 # =========================================================
@@ -1769,8 +1767,8 @@ async def process_url(
                 f"📂 الموضوع: {topic_name}\n"
                 f"📐 الجودة: {quality_text}\n"
                 f"📦 الحجم: {human_size(file_size)}\n\n"
-                f"📦 تمت إضافته إلى Queue الخاصة بـ«{topic_name}».\n"
-                f"⏳ سيتم إرسال الـ{ALBUM_SIZE} فيديوهات معًا عند اكتمال العدد."
+                f"📦 تمت إضافته إلى Queue الخاصة بالقسم.\n"
+                f"⏳ سيتم الإرسال تلقائيًا عند اكتمال {ALBUM_SIZE} فيديوهات في نفس القسم."
             )
 
             await enqueue_for_album(
@@ -1806,8 +1804,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text or update.message.caption or ""
-    urls = extract_urls(text)
-    if not urls:
+    url = extract_url(text)
+    if not url:
         return
 
     target_group_id = get_target_group_id()
@@ -1818,8 +1816,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Recover from a stale target_group_id when exactly one registered group contains Topics.
+    if not get_topics_for_group(target_group_id):
+        state = _get_combined_state()
+        all_topics = state.get("topics", {})
+        candidates = []
+        if isinstance(all_topics, dict):
+            for gid, topic_map in all_topics.items():
+                if isinstance(topic_map, dict) and topic_map:
+                    try: candidates.append(int(gid))
+                    except (TypeError, ValueError): pass
+        if len(candidates) == 1 and set_target_group_id(candidates[0]):
+            target_group_id = candidates[0]
+
     status_msg = await update.message.reply_text("📂 جاري فتح قائمة Topics...")
-    # Store ALL URLs from this Telegram message against the picker message.
+    # Store the URL against the picker/status message itself, because callback queries
+    # point to that message rather than the original user message.
     try:
         with db_connect() as conn:
             conn.execute(
@@ -1827,40 +1839,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 INSERT OR REPLACE INTO settings(key, value)
                 VALUES(?, ?)
                 """,
-                (f"topic_picker_urls:{status_msg.message_id}", json.dumps(urls, ensure_ascii=False)),
-            )
-            conn.execute(
-                "DELETE FROM settings WHERE key=?",
-                (f"topic_picker_url:{status_msg.message_id}",),
+                (f"topic_picker_url:{status_msg.message_id}", canonicalize_url(url)),
             )
             conn.commit()
     except Exception as exc:
-        logger.warning("Could not store topic picker URLs: %s", exc)
+        logger.warning("Could not store topic picker URL: %s", exc)
     await show_topic_picker(status_msg, target_group_id, edit=True)
 
 
-async def _get_picker_urls(message_id: int) -> list[str]:
+async def _get_picker_url(message_id: int) -> Optional[str]:
     try:
         with db_connect() as conn:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key=? LIMIT 1",
-                (f"topic_picker_urls:{message_id}",),
+                (f"topic_picker_url:{message_id}",),
             ).fetchone()
             if row and row[0]:
-                value = json.loads(str(row[0]))
-                if isinstance(value, list):
-                    return [str(item) for item in value if str(item).strip()]
-    except Exception as exc:
-        logger.warning("Could not read topic picker URLs: %s", exc)
-    return []
+                return str(row[0])
+    except Exception:
+        pass
+    return None
 
 
-async def _delete_picker_urls(message_id: int) -> None:
+async def _delete_picker_url(message_id: int) -> None:
     try:
         with db_connect() as conn:
             conn.execute(
-                "DELETE FROM settings WHERE key IN (?, ?)",
-                (f"topic_picker_urls:{message_id}", f"topic_picker_url:{message_id}"),
+                "DELETE FROM settings WHERE key=?",
+                (f"topic_picker_url:{message_id}",),
             )
             conn.commit()
     except Exception:
@@ -1948,37 +1954,27 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic_name = get_topic_name(group_id, thread_id)
         set_last_topic(group_id, thread_id)
 
-        # One Telegram message may contain one URL or many URLs (same line or separate lines).
-        # All URLs use the single Topic selected here.
+        # The status message is the one directly below/created for the user's URL.
         source_message_id = query.message.message_id
-        urls = await _get_picker_urls(source_message_id)
-        if not urls:
-            await query.answer("انتهت صلاحية روابط الفيديو.", show_alert=True)
+        url = await _get_picker_url(source_message_id)
+
+        if not url:
+            await query.answer("انتهت صلاحية رابط الفيديو.", show_alert=True)
             return
 
-        await _delete_picker_urls(source_message_id)
-        await query.answer(f"تم اختيار: {topic_name} — {len(urls)} رابط")
+        await _delete_picker_url(source_message_id)
+        await query.answer(f"تم اختيار: {topic_name}")
         await query.edit_message_text(
-            f"📂 تم اختيار: {topic_name}\n\n"
-            f"🔗 تم العثور على {len(urls)} رابط.\n"
-            "🔎 جاري معالجة كل الروابط..."
+            f"📂 تم اختيار: {topic_name}\n\n🔎 جاري بدء التحميل..."
         )
-
-        # Process every URL from the original Telegram message, not only the first one.
-        for index, url in enumerate(urls, 1):
-            if len(urls) > 1:
-                try:
-                    await query.message.reply_text(f"🔗 جاري معالجة الرابط {index}/{len(urls)}...")
-                except Exception:
-                    pass
-            await process_url(
-                update,
-                context,
-                url,
-                query.message,
-                topic_thread_id=thread_id,
-                topic_name=topic_name,
-            )
+        await process_url(
+            update,
+            context,
+            url,
+            query.message,
+            topic_thread_id=thread_id,
+            topic_name=topic_name,
+        )
         return
 
     if data.startswith("topic_default:"):
@@ -2192,7 +2188,7 @@ def main():
         "GitHub persistent state: %s",
         "enabled" if GITHUB_TOKEN and GITHUB_REPO else "disabled",
     )
-    logger.info("Album size: %s | no timer; wait for exact batch", ALBUM_SIZE)
+    logger.info("Album size: %s | flush: %ss", ALBUM_SIZE, ALBUM_FLUSH_SECONDS)
     logger.info("Protect content: %s", PROTECT_CONTENT)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
