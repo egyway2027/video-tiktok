@@ -671,8 +671,13 @@ async def set_topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    register_group(chat.id, chat.title or "")
-    register_topic(chat.id, int(thread_id), raw_name)
+    # The group where /settopic is executed is the real receiving group.
+    if not register_group(chat.id, chat.title or ""):
+        await update.message.reply_text("❌ تعذر تسجيل الجروب."); return
+    if not set_target_group_id(chat.id, chat.title or ""):
+        await update.message.reply_text("❌ تعذر تعيين هذا الجروب كجروب الاستقبال."); return
+    if not register_topic(chat.id, int(thread_id), raw_name):
+        await update.message.reply_text("❌ تعذر تسجيل الـTopic."); return
     set_last_topic(chat.id, int(thread_id))
 
     await update.message.reply_text(
@@ -1384,29 +1389,15 @@ def topic_keyboard(group_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _edit_picker_message(target, text: str, reply_markup=None):
-    """Edit either a CallbackQuery message or a Telegram Message safely."""
-    if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
-        return
-
-    if hasattr(target, "edit_text"):
-        await target.edit_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
-        return
-
-    raise TypeError(f"Unsupported picker target: {type(target)!r}")
-
-
 async def show_topic_picker(query_or_message, group_id: int, edit: bool = False):
     topics = get_topics_for_group(group_id)
+
+    async def _edit_message(text: str, reply_markup=None):
+        if hasattr(query_or_message, "edit_message_text"):
+            await query_or_message.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        else:
+            await query_or_message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
     if not topics:
         text = (
             "❌ لا توجد Topics مسجلة للبوت بعد.\n\n"
@@ -1416,21 +1407,17 @@ async def show_topic_picker(query_or_message, group_id: int, edit: bool = False)
             "`/settopic 🎵 أغاني`"
         )
         if edit:
-            await _edit_picker_message(query_or_message, text)
+            await _edit_message(text)
         else:
             await query_or_message.reply_text(text, parse_mode="Markdown")
         return
 
     text = "📂 اختر المكان الذي تريد حفظ الفيديو فيه:"
-    markup = topic_keyboard(group_id)
-
     if edit:
-        await _edit_picker_message(query_or_message, text, markup)
+        await _edit_message(text, reply_markup=topic_keyboard(group_id))
     else:
-        await query_or_message.reply_text(
-            text,
-            reply_markup=markup,
-        )
+        await query_or_message.reply_text(text, reply_markup=topic_keyboard(group_id))
+
 
 # =========================================================
 # Album queue
@@ -1828,6 +1815,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "استخدم /setgroup داخل الجروب المطلوب."
         )
         return
+
+    # Recover from a stale target_group_id when exactly one registered group contains Topics.
+    if not get_topics_for_group(target_group_id):
+        state = _get_combined_state()
+        all_topics = state.get("topics", {})
+        candidates = []
+        if isinstance(all_topics, dict):
+            for gid, topic_map in all_topics.items():
+                if isinstance(topic_map, dict) and topic_map:
+                    try: candidates.append(int(gid))
+                    except (TypeError, ValueError): pass
+        if len(candidates) == 1 and set_target_group_id(candidates[0]):
+            target_group_id = candidates[0]
 
     status_msg = await update.message.reply_text("📂 جاري فتح قائمة Topics...")
     # Store the URL against the picker/status message itself, because callback queries
