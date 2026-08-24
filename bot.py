@@ -1384,6 +1384,27 @@ def topic_keyboard(group_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+async def _edit_picker_message(target, text: str, reply_markup=None):
+    """Edit either a CallbackQuery message or a Telegram Message safely."""
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+        return
+
+    if hasattr(target, "edit_text"):
+        await target.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+        return
+
+    raise TypeError(f"Unsupported picker target: {type(target)!r}")
+
+
 async def show_topic_picker(query_or_message, group_id: int, edit: bool = False):
     topics = get_topics_for_group(group_id)
     if not topics:
@@ -1395,23 +1416,21 @@ async def show_topic_picker(query_or_message, group_id: int, edit: bool = False)
             "`/settopic 🎵 أغاني`"
         )
         if edit:
-            await query_or_message.edit_message_text(text, parse_mode="Markdown")
+            await _edit_picker_message(query_or_message, text)
         else:
             await query_or_message.reply_text(text, parse_mode="Markdown")
         return
 
     text = "📂 اختر المكان الذي تريد حفظ الفيديو فيه:"
+    markup = topic_keyboard(group_id)
+
     if edit:
-        await query_or_message.edit_message_text(
-            text,
-            reply_markup=topic_keyboard(group_id),
-        )
+        await _edit_picker_message(query_or_message, text, markup)
     else:
         await query_or_message.reply_text(
             text,
-            reply_markup=topic_keyboard(group_id),
+            reply_markup=markup,
         )
-
 
 # =========================================================
 # Album queue
