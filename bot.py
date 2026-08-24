@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -54,8 +55,9 @@ MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Album settings requested by the owner.
-ALBUM_SIZE = 4
-ALBUM_FLUSH_SECONDS = max(5, int(os.getenv("ALBUM_FLUSH_SECONDS", "30")))
+ALBUM_SIZE = 3
+# Album waits until 3 videos exist in the same topic. No timeout flush.
+ALBUM_FLUSH_SECONDS = 0
 
 # Set PROTECT_CONTENT=1 to prevent forwarding/saving of bot-sent media.
 # This does NOT make a group message invisible to selected members; Telegram does
@@ -879,11 +881,28 @@ def delete_pending_download(token: str) -> None:
 # =========================================================
 
 
+
+def resolve_social_share_url(url: str) -> str:
+    """Resolve Facebook/Instagram share links before yt-dlp."""
+    url = canonicalize_url(url)
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not any(x in host for x in ["facebook.com", "fb.watch", "instagram.com"]):
+        return url
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            final = r.geturl()
+            if final:
+                return canonicalize_url(final)
+    except Exception as exc:
+        logger.info("Share resolve failed %s: %s", url, exc)
+    return url
+
 def extract_url(text: str) -> Optional[str]:
     if not text:
         return None
     match = URL_REGEX.search(text)
-    return normalize_url(match.group(0)) if match else None
+    return resolve_social_share_url(normalize_url(match.group(0))) if match else None
 
 
 def get_site_name(url: str) -> str:
@@ -921,6 +940,8 @@ def get_site_name(url: str) -> str:
 def get_common_ydl_options() -> dict:
     options = {
         "quiet": True,
+        "retries": 5,
+        "fragment_retries": 5,
         "no_warnings": False,
         "noplaylist": True,
         "source_address": "0.0.0.0",
@@ -1561,9 +1582,9 @@ async def enqueue_for_album(
             if extras:
                 ALBUM_QUEUES[key] = extras
         else:
-            ALBUM_TASKS[key] = asyncio.create_task(
-                _flush_album_after_delay(context, key)
-            )
+            # Keep waiting until this exact topic reaches ALBUM_SIZE videos.
+            # No timer is created, so topics are never mixed or flushed early.
+            pass
 
     if ready_items:
         await _send_album(context, chat_id, thread_id, topic_name, ready_items)
@@ -1703,8 +1724,21 @@ async def process_url(
                     file_path = compressed
 
             file_size = os.path.getsize(file_path)
+            attempts = 0
+            while file_size > SAFE_MAX_BYTES and attempts < 2:
+                attempts += 1
+                compressed = await loop.run_in_executor(None, compress_video_to_limit, file_path)
+                if not compressed:
+                    break
+                if compressed != file_path:
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                    file_path = compressed
+                file_size = os.path.getsize(file_path)
             if file_size > SAFE_MAX_BYTES:
-                await status_msg.edit_text("❌ الملف النهائي ما زال أكبر من 48 MB.")
+                await status_msg.edit_text("❌ الملف النهائي ما زال أكبر من 48 MB بعد كل محاولات الضغط.")
                 return
 
             title = str((final_info or info or {}).get("title") or "").strip()[:800]
@@ -1727,8 +1761,8 @@ async def process_url(
                 f"📂 الموضوع: {topic_name}\n"
                 f"📐 الجودة: {quality_text}\n"
                 f"📦 الحجم: {human_size(file_size)}\n\n"
-                f"📦 تمت إضافته إلى Album من {ALBUM_SIZE} فيديوهات.\n"
-                f"⏱️ لو لم يكتمل العدد خلال {ALBUM_FLUSH_SECONDS} ثانية سيتم إرسال الموجود."
+                f"📦 تمت إضافته إلى Queue الخاصة بالقسم.\n"
+                f"⏳ سيتم الإرسال تلقائيًا عند اكتمال {ALBUM_SIZE} فيديوهات في نفس القسم."
             )
 
             await enqueue_for_album(
@@ -2045,6 +2079,51 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 
+
+async def setpassword_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update): return
+    if not context.args:
+        await update.message.reply_text("الاستخدام: /setpassword كلمة_السر")
+        return
+    hashed=hashlib.sha256(context.args[0].encode()).hexdigest()
+    with db_connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('password_hash',?)",(hashed,))
+    await update.message.reply_text("✅ تم حفظ كلمة السر بشكل Hash")
+
+async def unlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستخدام: /unlock كلمة_السر")
+        return
+    with db_connect() as conn:
+        row=conn.execute("SELECT value FROM settings WHERE key='password_hash'").fetchone()
+        if row and hashlib.sha256(context.args[0].encode()).hexdigest()==row[0]:
+            conn.execute("INSERT OR REPLACE INTO bot_access(user_id,unlocked_at) VALUES(?,?)",(str(update.effective_user.id),datetime.now().isoformat()))
+            await update.message.reply_text("✅ تم فتح الصلاحية")
+        else:
+            await update.message.reply_text("❌ كلمة السر غير صحيحة")
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update): return
+    with db_connect() as conn:
+        rows=conn.execute("SELECT user_id,unlocked_at FROM bot_access").fetchall()
+    await update.message.reply_text("👥 المستخدمون:\n"+"\n".join(f"{a} - {b}" for a,b in rows) if rows else "لا يوجد مستخدمون")
+
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update) or not context.args: return
+    with db_connect() as conn: conn.execute("DELETE FROM bot_access WHERE user_id=?",(context.args[0],))
+    await update.message.reply_text("✅ تم الحذف")
+
+async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update): return
+    with db_connect() as conn:
+        count=conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+    await update.message.reply_text(f"📚 المكتبة: {count} فيديو")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update): return
+    db=DATABASE_PATH.stat().st_size if DATABASE_PATH.exists() else 0
+    await update.message.reply_text(f"📊 Status\n\nDownloads: {sum(1 for _ in DOWNLOAD_DIR.glob('*'))}\nDB: {human_size(db)}\nQueue: {len(ALBUM_QUEUES)}")
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -2100,6 +2179,12 @@ def main():
     app.add_handler(CommandHandler("setgroup", set_group_command))
     app.add_handler(CommandHandler("settopic", set_topic_command))
     app.add_handler(CommandHandler("topics", topics_command))
+    app.add_handler(CommandHandler("setpassword", setpassword_command))
+    app.add_handler(CommandHandler("unlock", unlock_command))
+    app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("removeuser", removeuser_command))
+    app.add_handler(CommandHandler("library", library_command))
+    app.add_handler(CommandHandler("status", status_command))
 
     app.add_handler(
         CallbackQueryHandler(
