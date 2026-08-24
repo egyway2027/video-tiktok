@@ -903,11 +903,29 @@ def resolve_social_share_url(url: str) -> str:
         logger.info("Share resolve failed %s: %s", url, exc)
     return url
 
-def extract_url(text: str) -> Optional[str]:
+def extract_urls(text: str) -> list[str]:
+    """Extract every URL from a Telegram message, in the same order sent.
+
+    This intentionally supports both forms used by the owner:
+    - multiple URLs separated by spaces in one message
+    - one URL per line in the same message
+    """
     if not text:
-        return None
-    match = URL_REGEX.search(text)
-    return resolve_social_share_url(normalize_url(match.group(0))) if match else None
+        return []
+
+    urls = []
+    for match in URL_REGEX.finditer(text):
+        raw = match.group(0)
+        url = resolve_social_share_url(normalize_url(raw))
+        if url:
+            urls.append(url)
+    return urls
+
+
+def extract_url(text: str) -> Optional[str]:
+    """Backward-compatible single-URL helper."""
+    urls = extract_urls(text)
+    return urls[0] if urls else None
 
 
 def get_site_name(url: str) -> str:
@@ -1438,7 +1456,10 @@ async def _send_album(
     if not items:
         return
 
-    # Telegram media groups contain 2-10 items; the project uses 4.
+    sent_count = 0
+
+    # Telegram media groups contain 2-10 items. The project intentionally sends
+    # exactly ALBUM_SIZE (3) videos together when the queue reaches that size.
     if len(items) == 1:
         item = items[0]
         path = item["path"]
@@ -1456,6 +1477,7 @@ async def _send_album(
                     connect_timeout=30,
                     pool_timeout=30,
                 )
+            sent_count = 1
         except Exception:
             try:
                 with open(path, "rb") as handle:
@@ -1470,10 +1492,12 @@ async def _send_album(
                         connect_timeout=30,
                         pool_timeout=30,
                     )
+                sent_count = 1
             except Exception:
                 logger.exception("Single-item album fallback failed")
         finally:
             cleanup_download_files(item.get("cleanup_prefix", ""))
+
         return
 
     handles = []
@@ -1500,9 +1524,10 @@ async def _send_album(
             connect_timeout=30,
             pool_timeout=30,
         )
+        sent_count = len(items)
     except Exception as exc:
         logger.warning("send_media_group failed in topic %s: %s", topic_name, exc)
-        # Fallback: keep the videos usable even if album sending is rejected.
+        # Fallback: keep the videos usable even if Telegram rejects the album.
         for item in items:
             try:
                 with open(item["path"], "rb") as handle:
@@ -1518,6 +1543,7 @@ async def _send_album(
                         connect_timeout=30,
                         pool_timeout=30,
                     )
+                sent_count += 1
             except Exception:
                 logger.exception("Album individual fallback failed")
     finally:
@@ -1528,6 +1554,29 @@ async def _send_album(
                 pass
         for item in items:
             cleanup_download_files(item.get("cleanup_prefix", ""))
+
+    # This confirmation is deliberately sent only after the media group has
+    # actually been handed to Telegram. For the normal 3-video case it appears
+    # immediately after the album inside the same Topic.
+    if len(items) == ALBUM_SIZE:
+        if sent_count == ALBUM_SIZE:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=(
+                    f"✅ تم إرسال الـ{ALBUM_SIZE} فيديوهات إلى ألبوم «{topic_name}» بنجاح."
+                ),
+                protect_content=PROTECT_CONTENT,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=(
+                    f"⚠️ تم إرسال {sent_count} من أصل {ALBUM_SIZE} فيديوهات إلى ألبوم «{topic_name}»."
+                ),
+                protect_content=PROTECT_CONTENT,
+            )
 
 
 async def _flush_album_after_delay(
@@ -1804,8 +1853,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text or update.message.caption or ""
-    url = extract_url(text)
-    if not url:
+    urls = extract_urls(text)
+    if not urls:
         return
 
     target_group_id = get_target_group_id()
@@ -1830,35 +1879,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_group_id = candidates[0]
 
     status_msg = await update.message.reply_text("📂 جاري فتح قائمة Topics...")
-    # Store the URL against the picker/status message itself, because callback queries
-    # point to that message rather than the original user message.
+    # Store the COMPLETE URL list against the picker/status message itself.
+    # Callback queries point to this message, so storing only the first URL was
+    # the reason a message containing 3 URLs used to download only 1 video.
     try:
+        stored_urls = [canonicalize_url(url) for url in urls]
         with db_connect() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO settings(key, value)
                 VALUES(?, ?)
                 """,
-                (f"topic_picker_url:{status_msg.message_id}", canonicalize_url(url)),
+                (
+                    f"topic_picker_url:{status_msg.message_id}",
+                    json.dumps(stored_urls, ensure_ascii=False),
+                ),
             )
             conn.commit()
     except Exception as exc:
-        logger.warning("Could not store topic picker URL: %s", exc)
+        logger.warning("Could not store topic picker URLs: %s", exc)
     await show_topic_picker(status_msg, target_group_id, edit=True)
 
 
-async def _get_picker_url(message_id: int) -> Optional[str]:
+async def _get_picker_urls(message_id: int) -> list[str]:
     try:
         with db_connect() as conn:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key=? LIMIT 1",
                 (f"topic_picker_url:{message_id}",),
             ).fetchone()
-            if row and row[0]:
-                return str(row[0])
+            if not row or not row[0]:
+                return []
+
+            raw = str(row[0])
+            try:
+                value = json.loads(raw)
+            except Exception:
+                # Backward compatibility with a picker created by the previous
+                # version, which stored a single URL as plain text.
+                return [raw] if raw else []
+
+            if isinstance(value, list):
+                return [str(item) for item in value if str(item).strip()]
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
     except Exception:
         pass
-    return None
+    return []
+
+
+async def _get_picker_url(message_id: int) -> Optional[str]:
+    """Backward-compatible helper for old callback paths."""
+    urls = await _get_picker_urls(message_id)
+    return urls[0] if urls else None
 
 
 async def _delete_picker_url(message_id: int) -> None:
@@ -1954,26 +2027,37 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic_name = get_topic_name(group_id, thread_id)
         set_last_topic(group_id, thread_id)
 
-        # The status message is the one directly below/created for the user's URL.
+        # The status message is the one directly below/created for the user's URL(s).
         source_message_id = query.message.message_id
-        url = await _get_picker_url(source_message_id)
+        urls = await _get_picker_urls(source_message_id)
 
-        if not url:
-            await query.answer("انتهت صلاحية رابط الفيديو.", show_alert=True)
+        if not urls:
+            await query.answer("انتهت صلاحية روابط الفيديو.", show_alert=True)
             return
 
         await _delete_picker_url(source_message_id)
         await query.answer(f"تم اختيار: {topic_name}")
+
+        total_urls = len(urls)
+        for index, url in enumerate(urls, start=1):
+            await query.edit_message_text(
+                f"📂 تم اختيار: {topic_name}\n\n"
+                f"🔎 جاري معالجة الفيديو {index}/{total_urls}..."
+            )
+            await process_url(
+                update,
+                context,
+                url,
+                query.message,
+                topic_thread_id=thread_id,
+                topic_name=topic_name,
+            )
+
+        # The actual 3-video success confirmation is sent from _send_album in the
+        # receiving Topic, immediately after Telegram receives the media group.
         await query.edit_message_text(
-            f"📂 تم اختيار: {topic_name}\n\n🔎 جاري بدء التحميل..."
-        )
-        await process_url(
-            update,
-            context,
-            url,
-            query.message,
-            topic_thread_id=thread_id,
-            topic_name=topic_name,
+            f"✅ تمت معالجة {total_urls} رابط(روابط) وإضافتها للـQueue.\n"
+            f"📂 المكان: {topic_name}"
         )
         return
 
