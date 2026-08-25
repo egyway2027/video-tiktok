@@ -95,6 +95,9 @@ ALBUM_QUEUES: dict[str, list[dict]] = {}
 ALBUM_TASKS: dict[str, asyncio.Task] = {}
 ALBUM_LOCK = asyncio.Lock()
 
+# Keeps the real yt-dlp error text per URL so failures can be shown to the owner.
+LAST_EXTRACT_ERRORS: dict[str, str] = {}
+
 
 # =========================================================
 # Generic helpers
@@ -888,11 +891,10 @@ def delete_pending_download(token: str) -> None:
 
 
 def resolve_social_share_url(url: str) -> str:
-    """Resolve shortened and redirected share links before yt-dlp."""
+    """Resolve Facebook/Instagram share links before yt-dlp."""
     url = canonicalize_url(url)
     host = (urllib.parse.urlparse(url).hostname or "").lower()
-    short_domains = ["facebook.com", "fb.watch", "instagram.com", "tiktok.com", "vt.tiktok.com", "vm.tiktok.com", "t.co", "youtu.be", "pin.it"]
-    if not any(x in host for x in short_domains):
+    if not any(x in host for x in ["facebook.com", "fb.watch", "instagram.com"]):
         return url
     try:
         req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
@@ -960,20 +962,16 @@ def get_site_name(url: str) -> str:
 def get_common_ydl_options() -> dict:
     options = {
         "quiet": True,
-        "no_warnings": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "no_warnings": False,
         "noplaylist": True,
-        "nocheckcertificate": True,
-        "geo_bypass": True,
         "source_address": "0.0.0.0",
-        "retries": 10,
+        "retries": 5,
         "fragment_retries": 10,
-        "extractor_retries": 5,
+        "extractor_retries": 3,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 4,
-        "extractor_args": {
-            "youtube": {"player_client": ["android", "web", "ios"]},
-            "tiktok": {"web_api": True}
-        },
         "http_headers": {
             "User-Agent": HTTP_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
@@ -984,13 +982,15 @@ def get_common_ydl_options() -> dict:
         },
     }
 
-    cookie_target = COOKIES_FILE if (COOKIES_FILE and Path(COOKIES_FILE).exists()) else "cookies.txt"
-    if Path(cookie_target).exists():
-        options["cookiefile"] = str(Path(cookie_target).resolve())
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        options["cookiefile"] = COOKIES_FILE
 
+    # Deno is installed by the workflow for sites that require JavaScript execution.
     if shutil.which("deno"):
         options["js_runtimes"] = {"deno": {}}
 
+    # curl-cffi is supplied by yt-dlp[default,curl-cffi] in the current project.
+    # Use browser impersonation when the runtime supports it.
     if os.getenv("YTDLP_IMPERSONATE", "1").strip().lower() not in {"0", "false", "no"}:
         options["impersonate"] = "chrome"
 
@@ -1010,6 +1010,12 @@ def extract_info(url: str) -> Optional[dict]:
     plain.pop("impersonate", None)
     attempts.append({**plain, "skip_download": True})
 
+    # A pass without cookies helps when the stored cookies file is expired/invalid
+    # and is actively blocking requests that would otherwise work anonymously.
+    no_cookies = dict(base)
+    no_cookies.pop("cookiefile", None)
+    attempts.append({**no_cookies, "skip_download": True})
+
     last_error = None
     for index, options in enumerate(attempts, 1):
         try:
@@ -1023,6 +1029,7 @@ def extract_info(url: str) -> Optional[dict]:
             logger.warning("Info extraction attempt %s failed: %s", index, exc)
 
     logger.error("All yt-dlp info attempts failed: %s", last_error)
+    LAST_EXTRACT_ERRORS[url] = str(last_error) if last_error else ""
     return None
 
 
@@ -1180,6 +1187,9 @@ def download_with_yt_dlp(
     plain = dict(options)
     plain.pop("impersonate", None)
     attempts.append(plain)
+    no_cookies = dict(options)
+    no_cookies.pop("cookiefile", None)
+    attempts.append(no_cookies)
 
     last_error = None
     for index, attempt_options in enumerate(attempts, 1):
@@ -1194,6 +1204,8 @@ def download_with_yt_dlp(
             logger.warning("yt-dlp download attempt %s failed: %s", index, exc)
 
     logger.warning("yt-dlp download failed after retries: %s", last_error)
+    if last_error:
+        LAST_EXTRACT_ERRORS[url] = str(last_error)
     return None, info, selection
 
 
@@ -1350,12 +1362,13 @@ def compress_video_to_limit(input_path: str) -> Optional[str]:
 # =========================================================
 
 
-def get_download_error_message(site_name: str) -> str:
+def get_download_error_message(site_name: str, detail: str = "") -> str:
     cookies = (
         "✅ Cookies configured. لو استمر الفشل فالجلسة قد تكون منتهية."
         if COOKIES_FILE and Path(COOKIES_FILE).exists()
         else "ℹ️ المحتوى المقيد قد يحتاج COOKIES_B64 / cookies.txt صالح."
     )
+    detail_line = f"\n\n🛠️ السبب التقني:\n{detail[:500]}" if detail else ""
     return (
         f"❌ لم أستطع استخراج فيديو {site_name}.\n\n"
         "الأسباب المحتملة:\n"
@@ -1364,6 +1377,7 @@ def get_download_error_message(site_name: str) -> str:
         "• الرابط منتهي أو يعيد التوجيه إلى محتوى غير متاح.\n"
         "• طريقة الاستخراج تغيرت لدى الموقع.\n\n"
         f"{cookies}"
+        f"{detail_line}"
     )
 
 
@@ -1494,70 +1508,70 @@ async def _send_album(
             cleanup_download_files(item.get("cleanup_prefix", ""))
         return False
 
-        handles = []
-        media = []
-        album_sent_ok = False
-        try:
-            for index, item in enumerate(items):
-                meta = get_video_metadata(item["path"])
-                streams = meta.get("streams", [])
-                v_stream = next((s for s in streams if s.get("width") and s.get("height")), {})
-                width = int(v_stream.get("width") or 720)
-                height = int(v_stream.get("height") or 1280)
-                duration = int(float(meta.get("format", {}).get("duration") or 0)) or None
-
-                handle = open(item["path"], "rb")
-                handles.append(handle)
-                media.append(
-                    InputMediaVideo(
-                        media=handle,
-                        caption=item.get("caption", "") if index == 0 else None,
-                        width=width,
-                        height=height,
-                        duration=duration,
-                        supports_streaming=True,
-                    )
+    handles = []
+    media = []
+    success = False
+    try:
+        for index, item in enumerate(items):
+            handle = open(item["path"], "rb")
+            handles.append(handle)
+            meta = get_video_metadata(item["path"])
+            width = height = None
+            for stream in meta.get("streams", []) if meta else []:
+                if stream.get("width") and stream.get("height"):
+                    width = int(stream["width"])
+                    height = int(stream["height"])
+                    break
+            media.append(
+                InputMediaVideo(
+                    media=handle,
+                    caption=item.get("caption", "") if index == 0 else None,
+                    supports_streaming=True,
+                    width=width,
+                    height=height,
                 )
-
-            await context.bot.send_media_group(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                media=media,
-                protect_content=PROTECT_CONTENT,
-                read_timeout=180,
-                write_timeout=180,
-                connect_timeout=30,
-                pool_timeout=30,
             )
-            album_sent_ok = True
-        except Exception as exc:
-            logger.warning("send_media_group failed in topic %s: %s", topic_name, exc)
-            for item in items:
-                try:
-                    with open(item["path"], "rb") as handle:
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            message_thread_id=thread_id,
-                            video=handle,
-                            caption=item.get("caption", ""),
-                            supports_streaming=True,
-                            protect_content=PROTECT_CONTENT,
-                            read_timeout=180,
-                            write_timeout=180,
-                            connect_timeout=30,
-                            pool_timeout=30,
-                        )
-                except Exception:
-                    logger.exception("Album individual fallback failed")
-        finally:
-            for handle in handles:
-                try:
-                    handle.close()
-                except Exception:
-                    pass
-            for item in items:
-                cleanup_download_files(item.get("cleanup_prefix", ""))
-        return album_sent_ok
+
+        await context.bot.send_media_group(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            media=media,
+            protect_content=PROTECT_CONTENT,
+            read_timeout=180,
+            write_timeout=180,
+            connect_timeout=30,
+            pool_timeout=30,
+        )
+        success = True
+    except Exception as exc:
+        logger.warning("send_media_group failed in topic %s: %s", topic_name, exc)
+        # Fallback: keep the videos usable even if album sending is rejected.
+        for item in items:
+            try:
+                with open(item["path"], "rb") as handle:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        video=handle,
+                        caption=item.get("caption", ""),
+                        supports_streaming=True,
+                        protect_content=PROTECT_CONTENT,
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
+            except Exception:
+                logger.exception("Album individual fallback failed")
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        for item in items:
+            cleanup_download_files(item.get("cleanup_prefix", ""))
+    return success
 
 
 async def _flush_album_after_delay(
@@ -1734,7 +1748,9 @@ async def process_url(
                 )
 
             if not file_path or not os.path.isfile(file_path):
-                await status_msg.edit_text(get_download_error_message(site_name))
+                await status_msg.edit_text(
+                    get_download_error_message(site_name, LAST_EXTRACT_ERRORS.get(url, ""))
+                )
                 return
 
             file_size = os.path.getsize(file_path)
@@ -1815,7 +1831,7 @@ async def process_url(
 
             if album_sent:
                 await status_msg.edit_text(
-                    "✅ تم إرسال الـ3 فيديوهات إلى الألبوم "
+                    f"✅ تم إرسال الـ{ALBUM_SIZE} فيديوهات إلى الألبوم "
                     f"«{topic_name}» بنجاح.\n\n"
                     "🎬 تم إرسالهم معًا كألبوم واحد."
                 )
@@ -2029,17 +2045,20 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔎 جاري بدء تحميل {len(urls)} فيديو..."
         )
 
-        # Process every URL captured from the original message with separate status handling.
-        for idx, url in enumerate(urls):
-            if idx == 0:
-                current_status_msg = query.message
+        # Process every URL captured from the original message. The same Topic is
+        # passed to every item, so the existing queue/album logic remains untouched.
+        for index, url in enumerate(urls, start=1):
+            if len(urls) > 1:
+                item_status = await query.message.reply_text(
+                    f"⏳ جاري معالجة رابط {index} من {len(urls)}..."
+                )
             else:
-                current_status_msg = await query.message.reply_text(f"⏳ جاري بدء تجهيز الرابط ({idx+1}/{len(urls)})...")
+                item_status = query.message
             await process_url(
                 update,
                 context,
                 url,
-                current_status_msg,
+                item_status,
                 topic_thread_id=thread_id,
                 topic_name=topic_name,
             )
