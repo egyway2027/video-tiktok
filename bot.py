@@ -1000,6 +1000,80 @@ def extract_tiktok_api(url: str) -> Optional[dict]:
 
     return None
 
+
+def extract_twitter_api(url: str) -> Optional[dict]:
+    """Direct API fallback for Twitter / X bypassing guest token limits."""
+    clean = normalize_url(url)
+    try:
+        parsed = urllib.parse.urlsplit(clean)
+        api_url = f"https://api.vxtwitter.com{parsed.path}"
+        req = urllib.request.Request(api_url, headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            videos = [m for m in data.get("media_extended", []) if m.get("type") == "video" and m.get("url")]
+            if videos:
+                best = videos[0]
+                return {
+                    "id": str(data.get("conversation_id") or secrets.randbelow(1000000)),
+                    "title": str(data.get("text") or "X / Twitter Video"),
+                    "extractor": "twitter",
+                    "extractor_key": "Twitter",
+                    "direct_url": best["url"],
+                    "duration": float(best.get("duration_millis") or 0) / 1000 or None,
+                    "width": int(best.get("size", {}).get("width") or 720),
+                    "height": int(best.get("size", {}).get("height") or 1280),
+                }
+    except Exception as exc:
+        logger.warning("Twitter API fallback failed: %s", exc)
+    return None
+
+
+def extract_universal_api(url: str) -> Optional[dict]:
+    """Universal direct API fallback for Instagram, Facebook, Reddit, Pinterest, YouTube, etc."""
+    clean = normalize_url(url)
+    host = (urllib.parse.urlparse(clean).hostname or "").lower()
+
+    if any(x in host for x in ("twitter.com", "x.com")):
+        tw_res = extract_twitter_api(clean)
+        if tw_res:
+            return tw_res
+
+    instances = [
+        "https://cobalt-api.kwiatekm.tokyo/",
+        "https://api.cobalt.tools/",
+        "https://cobalt.api.redstream.online/",
+    ]
+    payload = json.dumps({"url": clean, "videoQuality": "1080"}).encode("utf-8")
+    for inst in instances:
+        try:
+            req = urllib.request.Request(
+                inst,
+                data=payload,
+                headers={
+                    "User-Agent": HTTP_USER_AGENT,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                direct_url = data.get("url")
+                if direct_url:
+                    return {
+                        "id": str(secrets.randbelow(1000000)),
+                        "title": str(data.get("filename") or f"{get_site_name(clean)} Video"),
+                        "extractor": "universal_api",
+                        "extractor_key": get_site_name(clean),
+                        "direct_url": direct_url,
+                        "duration": None,
+                        "width": 720,
+                        "height": 1280,
+                    }
+        except Exception as exc:
+            logger.debug("Universal API endpoint %s error: %s", inst, exc)
+            continue
+    return None
+
 def extract_urls(text: str) -> list[str]:
     """Extract every URL from a message, preserving message order."""
     if not text:
@@ -1056,16 +1130,21 @@ def get_site_name(url: str) -> str:
 def get_common_ydl_options() -> dict:
     options = {
         "quiet": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "no_warnings": False,
+        "no_warnings": True,
         "noplaylist": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
         "source_address": "0.0.0.0",
         "retries": 5,
         "fragment_retries": 10,
         "extractor_retries": 3,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 4,
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "ios", "mweb", "web_creator"]},
+            "tiktok": {"web_api": True},
+            "instagram": {"api_override": True},
+        },
         "http_headers": {
             "User-Agent": HTTP_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
@@ -1099,6 +1178,11 @@ def extract_info(url: str) -> Optional[dict]:
         if api_info:
             return api_info
 
+    if any(x in host for x in ("twitter.com", "x.com")):
+        tw_info = extract_twitter_api(url)
+        if tw_info:
+            return tw_info
+
     attempts = []
     base = get_common_ydl_options()
     attempts.append({**base, "skip_download": True})
@@ -1124,7 +1208,13 @@ def extract_info(url: str) -> Optional[dict]:
             last_error = exc
             logger.warning("Info extraction attempt %s failed: %s", index, exc)
 
-    logger.error("All yt-dlp info attempts failed: %s", last_error)
+    # Universal API Fallback for Instagram, Facebook, Reddit, Pinterest, etc.
+    univ_info = extract_universal_api(url)
+    if univ_info:
+        logger.info("Extracted successfully using Universal API fallback: %s", url)
+        return univ_info
+
+    logger.error("All info extraction attempts failed: %s", last_error)
     LAST_EXTRACT_ERRORS[url] = str(last_error) if last_error else ""
     return None
 
