@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import urllib.error
-import urllib.parse
+imp
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
