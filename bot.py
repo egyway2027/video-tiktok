@@ -912,10 +912,13 @@ def resolve_social_share_url(url: str) -> str:
     return url
 
 def extract_tiktok_api(url: str) -> Optional[dict]:
-    """Direct API fallback for TikTok bypassing server IP blocks."""
+    """Direct multi-API fallback for TikTok bypassing server IP and age/login restrictions."""
+    clean_url = normalize_url(url)
+
+    # Engine 1: TikWM API
     try:
         api_url = "https://www.tikwm.com/api/"
-        payload = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
+        payload = urllib.parse.urlencode({"url": clean_url, "hd": 1}).encode("utf-8")
         req = urllib.request.Request(
             api_url,
             data=payload,
@@ -927,6 +930,8 @@ def extract_tiktok_api(url: str) -> Optional[dict]:
                 item = data["data"]
                 play_url = item.get("hdplay") or item.get("play") or item.get("wmplay")
                 if play_url:
+                    if play_url.startswith("/"):
+                        play_url = "https://www.tikwm.com" + play_url
                     return {
                         "id": str(item.get("id") or secrets.randbelow(1000000)),
                         "title": str(item.get("title") or "TikTok Video"),
@@ -938,7 +943,61 @@ def extract_tiktok_api(url: str) -> Optional[dict]:
                         "height": int(item.get("height") or 1280),
                     }
     except Exception as exc:
-        logger.warning("TikTok API error: %s", exc)
+        logger.warning("TikWM API error: %s", exc)
+
+    # Engine 2: Tiklydown API
+    try:
+        api_url = f"https://api.tiklydown.eu.org/api/download?url={urllib.parse.quote(clean_url)}"
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            video_url = None
+            if "video" in data and isinstance(data["video"], dict):
+                video_url = data["video"].get("noWatermark") or data["video"].get("watermark")
+            if video_url:
+                return {
+                    "id": str(data.get("id") or secrets.randbelow(1000000)),
+                    "title": str(data.get("title") or "TikTok Video"),
+                    "extractor": "tiktok",
+                    "extractor_key": "TikTok",
+                    "direct_url": video_url,
+                    "duration": None,
+                    "width": 720,
+                    "height": 1280,
+                }
+    except Exception as exc:
+        logger.warning("Tiklydown API error: %s", exc)
+
+    # Engine 3: LoVeTik API
+    try:
+        api_url = "https://lovetik.com/api/ajax/search"
+        payload = urllib.parse.urlencode({"query": clean_url}).encode("utf-8")
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") == "ok" and "links" in data:
+                for link in data["links"]:
+                    if link.get("a") and ("mp4" in str(link.get("t", "")).lower() or link.get("ft") == 1):
+                        return {
+                            "id": str(data.get("vid") or secrets.randbelow(1000000)),
+                            "title": str(data.get("desc") or "TikTok Video"),
+                            "extractor": "tiktok",
+                            "extractor_key": "TikTok",
+                            "direct_url": link["a"],
+                            "duration": None,
+                            "width": 720,
+                            "height": 1280,
+                        }
+    except Exception as exc:
+        logger.warning("LoVeTik API error: %s", exc)
+
     return None
 
 def extract_urls(text: str) -> list[str]:
@@ -1258,19 +1317,20 @@ def download_with_yt_dlp(
 
 
 def _looks_like_video_url(url: str, content_type: str = "") -> bool:
-    if content_type.lower().split(";", 1)[0].startswith("video/"):
+    ct = content_type.lower().split(";", 1)[0].strip()
+    if ct.startswith("video/") or ct in ("application/octet-stream", "binary/octet-stream", "application/x-mpegurl"):
         return True
     path = urllib.parse.urlparse(url).path.lower()
-    return path.endswith((".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv", ".ts"))
+    return path.endswith((".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv", ".ts")) or "video" in path or "play" in path
 
 
 def download_direct_video(url: str, output_base: Path) -> Optional[str]:
     request = urllib.request.Request(
-        canonicalize_url(url),
-        headers={"User-Agent": HTTP_USER_AGENT, "Accept": "*/*"},
+        url,
+        headers={"User-Agent": HTTP_USER_AGENT, "Accept": "*/*", "Referer": "https://www.tiktok.com/"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=45) as response:
             final_url = response.geturl()
             content_type = response.headers.get("Content-Type", "")
             if not _looks_like_video_url(final_url, content_type):
@@ -1284,15 +1344,14 @@ def download_direct_video(url: str, output_base: Path) -> Optional[str]:
                 except ValueError:
                     pass
 
-            suffix = Path(urllib.parse.urlparse(final_url).path).suffix or ".mp4"
-            target = output_base.with_suffix(suffix)
+            target = output_base.with_suffix(".mp4")
             with target.open("wb") as handle:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     handle.write(chunk)
-            return str(target) if target.exists() and target.stat().st_size else None
+            return str(target) if target.exists() and target.stat().st_size > 1024 else None
     except Exception as exc:
         logger.warning("Direct video download failed: %s", exc)
         return None
@@ -1561,18 +1620,16 @@ async def _send_album(
             handles.append(handle)
             meta = get_video_metadata(item["path"])
             streams = meta.get("streams", []) if meta else []
-            v_stream = streams[0] if streams else {}
-            width = int(v_stream.get("width") or 720)
-            height = int(v_stream.get("height") or 1280)
             duration = int(float(meta.get("format", {}).get("duration") or 0)) or None
 
+            # Force uniform dimensions to ensure Telegram places all 3 videos side-by-side in one row
             media.append(
                 InputMediaVideo(
                     media=handle,
                     caption=item.get("caption", "") if index == 0 else None,
                     supports_streaming=True,
-                    width=width,
-                    height=height,
+                    width=720,
+                    height=720,
                     duration=duration,
                 )
             )
