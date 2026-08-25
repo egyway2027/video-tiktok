@@ -891,10 +891,15 @@ def delete_pending_download(token: str) -> None:
 
 
 def resolve_social_share_url(url: str) -> str:
-    """Resolve Facebook/Instagram share links before yt-dlp."""
+    """Resolve shortened and redirected share links before yt-dlp."""
     url = canonicalize_url(url)
     host = (urllib.parse.urlparse(url).hostname or "").lower()
-    if not any(x in host for x in ["facebook.com", "fb.watch", "instagram.com"]):
+    short_domains = [
+        "facebook.com", "fb.watch", "instagram.com",
+        "tiktok.com", "vt.tiktok.com", "vm.tiktok.com",
+        "t.co", "youtu.be", "pin.it"
+    ]
+    if not any(x in host for x in short_domains):
         return url
     try:
         req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
@@ -905,6 +910,36 @@ def resolve_social_share_url(url: str) -> str:
     except Exception as exc:
         logger.info("Share resolve failed %s: %s", url, exc)
     return url
+
+def extract_tiktok_api(url: str) -> Optional[dict]:
+    """Direct API fallback for TikTok bypassing server IP blocks."""
+    try:
+        api_url = "https://www.tikwm.com/api/"
+        payload = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("code") == 0 and "data" in data:
+                item = data["data"]
+                play_url = item.get("hdplay") or item.get("play") or item.get("wmplay")
+                if play_url:
+                    return {
+                        "id": str(item.get("id") or secrets.randbelow(1000000)),
+                        "title": str(item.get("title") or "TikTok Video"),
+                        "extractor": "tiktok",
+                        "extractor_key": "TikTok",
+                        "direct_url": play_url,
+                        "duration": float(item.get("duration") or 0) or None,
+                        "width": int(item.get("width") or 720),
+                        "height": int(item.get("height") or 1280),
+                    }
+    except Exception as exc:
+        logger.warning("TikTok API error: %s", exc)
+    return None
 
 def extract_urls(text: str) -> list[str]:
     """Extract every URL from a message, preserving message order."""
@@ -999,19 +1034,21 @@ def get_common_ydl_options() -> dict:
 
 def extract_info(url: str) -> Optional[dict]:
     url = normalize_url(url)
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if "tiktok.com" in host or "douyin.com" in host:
+        api_info = extract_tiktok_api(url)
+        if api_info:
+            return api_info
+
     attempts = []
     base = get_common_ydl_options()
     attempts.append({**base, "skip_download": True})
     attempts.append({**base, "skip_download": True, "geo_bypass": True})
 
-    # A second pass without impersonation helps when a site's extractor rejects
-    # browser emulation for a particular endpoint.
     plain = dict(base)
     plain.pop("impersonate", None)
     attempts.append({**plain, "skip_download": True})
 
-    # A pass without cookies helps when the stored cookies file is expired/invalid
-    # and is actively blocking requests that would otherwise work anonymously.
     no_cookies = dict(base)
     no_cookies.pop("cookiefile", None)
     attempts.append({**no_cookies, "skip_download": True})
@@ -1166,6 +1203,12 @@ def download_with_yt_dlp(
     if not info:
         return None, None, {}
 
+    if info.get("direct_url"):
+        target_path = Path(output_template.replace("%(ext)s", "mp4"))
+        direct_file = download_direct_video(info["direct_url"], target_path.with_suffix(""))
+        if direct_file:
+            return direct_file, info, {"height": info.get("height", 1080)}
+
     expression, selection = choose_best_format(info, SAFE_MAX_BYTES)
     if not expression:
         expression = "bestvideo+bestaudio/best"
@@ -1267,6 +1310,7 @@ def get_video_metadata(path: str) -> dict:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
                 "-show_entries", "format=duration:stream=width,height",
                 "-of", "json", path,
             ],
@@ -1516,12 +1560,12 @@ async def _send_album(
             handle = open(item["path"], "rb")
             handles.append(handle)
             meta = get_video_metadata(item["path"])
-            width = height = None
-            for stream in meta.get("streams", []) if meta else []:
-                if stream.get("width") and stream.get("height"):
-                    width = int(stream["width"])
-                    height = int(stream["height"])
-                    break
+            streams = meta.get("streams", []) if meta else []
+            v_stream = streams[0] if streams else {}
+            width = int(v_stream.get("width") or 720)
+            height = int(v_stream.get("height") or 1280)
+            duration = int(float(meta.get("format", {}).get("duration") or 0)) or None
+
             media.append(
                 InputMediaVideo(
                     media=handle,
@@ -1529,6 +1573,7 @@ async def _send_album(
                     supports_streaming=True,
                     width=width,
                     height=height,
+                    duration=duration,
                 )
             )
 
@@ -1545,7 +1590,6 @@ async def _send_album(
         success = True
     except Exception as exc:
         logger.warning("send_media_group failed in topic %s: %s", topic_name, exc)
-        # Fallback: keep the videos usable even if album sending is rejected.
         for item in items:
             try:
                 with open(item["path"], "rb") as handle:
