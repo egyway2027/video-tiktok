@@ -55,9 +55,11 @@ MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Album settings requested by the owner.
-ALBUM_SIZE = 3
-# Album waits until 3 videos exist in the same topic. No timeout flush.
-ALBUM_FLUSH_SECONDS = 0
+# 6 videos per album so Telegram lays them out as 2 rows of 3 (square media).
+ALBUM_SIZE = 6
+# If the queue doesn't reach ALBUM_SIZE, flush whatever is waiting after this many
+# seconds so videos never get stuck forever. Overridable via env var.
+ALBUM_FLUSH_SECONDS = int(os.getenv("ALBUM_FLUSH_SECONDS", "45"))
 
 # Set PROTECT_CONTENT=1 to prevent forwarding/saving of bot-sent media.
 # This does NOT make a group message invisible to selected members; Telegram does
@@ -1663,7 +1665,7 @@ async def _send_album(
     if not items:
         return False
 
-    # Telegram media groups contain 2-10 items; the project uses 4.
+    # Telegram media groups contain 2-10 items; the project uses ALBUM_SIZE (6).
     if len(items) == 1:
         item = items[0]
         path = item["path"]
@@ -1712,7 +1714,9 @@ async def _send_album(
             streams = meta.get("streams", []) if meta else []
             duration = int(float(meta.get("format", {}).get("duration") or 0)) or None
 
-            # Force uniform dimensions to ensure Telegram places all 3 videos side-by-side in one row
+            # Force uniform square dimensions so Telegram lays the album out as a grid
+            # (3 videos per row) instead of one long column — with ALBUM_SIZE=6 this
+            # gives 2 rows of 3.
             media.append(
                 InputMediaVideo(
                     media=handle,
@@ -1823,9 +1827,11 @@ async def enqueue_for_album(
             if extras:
                 ALBUM_QUEUES[key] = extras
         else:
-            # Keep waiting until this exact topic reaches ALBUM_SIZE videos.
-            # No timer is created, so topics are never mixed or flushed early.
-            pass
+            # Not full yet: (re)arm a flush timer so these videos are still sent
+            # after ALBUM_FLUSH_SECONDS even if the topic never reaches ALBUM_SIZE.
+            # Every new item resets the timer (old task cancelled above), so the
+            # flush only fires once no new video has arrived for a while.
+            ALBUM_TASKS[key] = asyncio.create_task(_flush_album_after_delay(context, key))
 
     if ready_items:
         return await _send_album(context, chat_id, thread_id, topic_name, ready_items)
@@ -2053,6 +2059,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not urls:
         return
 
+    await _handle_extracted_urls(update, context, urls)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle .txt files: read every URL inside and process them like a text message."""
+    if not update.message or not update.message.document:
+        return
+    if not await is_owner(update):
+        return
+
+    doc = update.message.document
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        raw_bytes = await tg_file.download_as_bytearray()
+        content = bytes(raw_bytes).decode("utf-8", errors="ignore")
+    except Exception as exc:
+        logger.warning("Failed reading uploaded txt file: %s", exc)
+        await update.message.reply_text("❌ تعذّرت قراءة الملف.")
+        return
+
+    urls = extract_urls(content)
+    if not urls:
+        await update.message.reply_text("⚠️ لم يتم العثور على أي روابط داخل الملف.")
+        return
+
+    await _handle_extracted_urls(update, context, urls)
+
+
+async def _handle_extracted_urls(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: list[str]):
+    """Shared flow: show the topic picker for a list of URLs already extracted
+    from either a text/caption message or an uploaded .txt file."""
     target_group_id = get_target_group_id()
     if not target_group_id:
         await update.message.reply_text(
@@ -2499,6 +2536,12 @@ def main():
         CallbackQueryHandler(admin_callback)
     )
 
+    app.add_handler(
+        MessageHandler(
+            filters.Document.FileExtension("txt") | filters.Document.MimeType("text/plain"),
+            handle_document,
+        )
+    )
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
